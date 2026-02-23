@@ -9,7 +9,7 @@ import random
 import string
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from uuid import uuid4
 from urllib.request import Request, urlopen, build_opener, ProxyHandler
 from urllib.error import HTTPError, URLError
@@ -231,12 +231,13 @@ async def _generate_sentinel_token_lightweight(proxy_url: str = None, device_id:
         await context.close()
 
 
-async def _get_cached_sentinel_token(proxy_url: str = None, force_refresh: bool = False) -> str:
+async def _get_cached_sentinel_token(proxy_url: str = None, force_refresh: bool = False, access_token: Optional[str] = None) -> str:
     """Get sentinel token with caching support
 
     Args:
         proxy_url: Optional proxy URL
         force_refresh: Force refresh token (e.g., after 400 error)
+        access_token: Optional access token to send to external POW service
 
     Returns:
         Sentinel token string or None
@@ -250,7 +251,7 @@ async def _get_cached_sentinel_token(proxy_url: str = None, force_refresh: bool 
     if config.pow_service_mode == "external":
         debug_logger.log_info("[POW] Using external POW service (cached sentinel)")
         from .pow_service_client import pow_service_client
-        result = await pow_service_client.get_sentinel_token()
+        result = await pow_service_client.get_sentinel_token(access_token=access_token)
 
         if result:
             sentinel_token, device_id, service_user_agent = result
@@ -754,7 +755,7 @@ class SoraClient:
         # Check if external POW service is configured
         if config.pow_service_mode == "external":
             debug_logger.log_info("[Sentinel] Using external POW service...")
-            result = await pow_service_client.get_sentinel_token()
+            result = await pow_service_client.get_sentinel_token(access_token=token)
 
             if result:
                 sentinel_token, device_id, service_user_agent = result
@@ -1141,7 +1142,7 @@ class SoraClient:
 
         # Try to get cached sentinel token first (using lightweight Playwright approach)
         try:
-            sentinel_token = await _get_cached_sentinel_token(pow_proxy_url, force_refresh=False)
+            sentinel_token = await _get_cached_sentinel_token(pow_proxy_url, force_refresh=False, access_token=token)
         except Exception as e:
             # 403/429 errors from oai-did fetch - don't retry, just fail
             error_str = str(e)
@@ -1175,7 +1176,7 @@ class SoraClient:
                 _invalidate_sentinel_cache()
                 
                 try:
-                    sentinel_token = await _get_cached_sentinel_token(pow_proxy_url, force_refresh=True)
+                    sentinel_token = await _get_cached_sentinel_token(pow_proxy_url, force_refresh=True, access_token=token)
                 except Exception as refresh_e:
                     # 403/429 errors - don't continue
                     error_str = str(refresh_e)
@@ -1431,6 +1432,33 @@ class SoraClient:
 
         result = await self._make_request("POST", "/characters/upload", token, multipart=mp)
         return result.get("id")
+
+    async def create_character_from_generation(self, generation_id: str, token: str,
+                                              timestamps: Optional[List[int]] = None) -> str:
+        """Create character cameo from generation id.
+
+        Args:
+            generation_id: Generation ID (gen_xxx)
+            token: Access token
+            timestamps: Optional frame timestamps, defaults to [0, 3]
+
+        Returns:
+            cameo_id
+        """
+        if timestamps is None:
+            timestamps = [0, 3]
+
+        json_data = {
+            "generation_id": generation_id,
+            "character_id": None,
+            "timestamps": timestamps
+        }
+        result = await self._make_request("POST", "/characters/from-generation", token, json_data=json_data)
+        return result.get("id")
+
+    async def get_post_detail(self, post_id: str, token: str) -> Dict[str, Any]:
+        """Get Sora post detail by post id (s_xxx)."""
+        return await self._make_request("GET", f"/project_y/post/{post_id}", token)
 
     async def get_cameo_status(self, cameo_id: str, token: str) -> Dict[str, Any]:
         """Get character (cameo) processing status

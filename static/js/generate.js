@@ -4771,9 +4771,13 @@
         }
       });
     } else if (batchType === 'character') {
-      // 角色卡模式：只需要视频文件，不需要提示词
+      if (model !== 'avatar-create') {
+        showToast('角色卡模式请先切换模型为“角色创建（视频优先 / 支持提示词generation_id）/avatar-create”', 'warn', { title: '模型不匹配', duration: 4200 });
+        return;
+      }
+      // 角色卡模式：只使用视频文件（提示词内 generation_id 请走普通模式）
       if (!files.length) {
-        showToast('角色卡模式：请上传视频文件', 'warn', { title: '缺少视频', duration: 3600 });
+        showToast('角色卡模式：请上传视频文件（提示词generation_id请用普通模式）', 'warn', { title: '缺少视频', duration: 3600 });
         return;
       }
       const videoFile = files.find((f) => (f.type || '').startsWith('video'));

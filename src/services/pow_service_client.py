@@ -10,8 +10,11 @@ from ..core.logger import debug_logger
 class POWServiceClient:
     """Client for external POW service API"""
 
-    async def get_sentinel_token(self) -> Optional[Tuple[str, str, str]]:
+    async def get_sentinel_token(self, access_token: Optional[str] = None) -> Optional[Tuple[str, str, str]]:
         """Get sentinel token from external POW service
+
+        Args:
+            access_token: Optional access token to send to POW service
 
         Returns:
             Tuple of (sentinel_token, device_id, user_agent) or None on failure
@@ -38,6 +41,10 @@ class POWServiceClient:
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json"
         }
+
+        # Add access_token to headers if provided
+        if access_token:
+            headers["X-Access-Token"] = access_token
 
         try:
             debug_logger.log_info(f"[POW Service] Requesting token from {api_url}")

@@ -55,6 +55,8 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
             description += f" - {config['width']}x{config['height']}"
         elif config['type'] == 'video':
             description += f" - {config['orientation']}"
+        elif config['type'] == 'avatar_create':
+            description += " - create avatar from video"
         elif config['type'] == 'prompt_enhance':
             description += f" - {config['expansion_level']} ({config['duration_s']}s)"
 
@@ -105,18 +107,22 @@ async def create_chat_completion(
         if isinstance(content, str):
             # Simple string format
             prompt = content
-            # Extract remix_target_id from prompt if not already provided
-            if not remix_target_id:
-                remix_target_id = _extract_remix_id(prompt)
+            # Extract sora id from prompt if not already provided
+            extracted_id = _extract_remix_id(prompt)
+            if extracted_id:
+                if not remix_target_id:
+                    remix_target_id = extracted_id
         elif isinstance(content, list):
             # Array format (OpenAI multimodal)
             for item in content:
                 if isinstance(item, dict):
                     if item.get("type") == "text":
                         prompt = item.get("text", "")
-                        # Extract remix_target_id from prompt if not already provided
-                        if not remix_target_id:
-                            remix_target_id = _extract_remix_id(prompt)
+                        # Extract sora id from prompt if not already provided
+                        extracted_id = _extract_remix_id(prompt)
+                        if extracted_id:
+                            if not remix_target_id:
+                                remix_target_id = extracted_id
                     elif item.get("type") == "image_url":
                         # Extract base64 image from data URI
                         image_url = item.get("image_url", {})
@@ -149,7 +155,7 @@ async def create_chat_completion(
 
         # Check if this is a video model
         model_config = MODEL_CONFIG[request.model]
-        is_video_model = model_config["type"] == "video"
+        is_video_model = model_config["type"] in ["video", "avatar_create"]
 
         # For video models with video parameter, we need streaming
         if is_video_model and (video_data or remix_target_id):
