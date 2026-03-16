@@ -1,10 +1,23 @@
 """Database storage layer"""
 import aiosqlite
-import json
 from datetime import datetime
-from typing import Optional, List
+from typing import Any, Dict, List, Optional
 from pathlib import Path
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, WatermarkFreeConfig, CacheConfig, GenerationConfig, TokenRefreshConfig
+from .models import (
+    AdminConfig,
+    CacheConfig,
+    CallLogicConfig,
+    GenerationConfig,
+    PowProxyConfig,
+    PowServiceConfig,
+    ProxyConfig,
+    RequestLog,
+    Task,
+    Token,
+    TokenRefreshConfig,
+    TokenStats,
+    WatermarkFreeConfig,
+)
 
 class Database:
     """SQLite database manager"""
@@ -460,6 +473,18 @@ class Database:
                 columns_to_add = [
                     ("task_id", "TEXT"),
                     ("updated_at", "TIMESTAMP"),
+                    ("phase", "TEXT"),
+                    ("mutation_type", "TEXT"),
+                    ("execution_strategy", "TEXT"),
+                    ("profile_id", "TEXT"),
+                    ("window_id", "TEXT"),
+                    ("auth_refreshed_at", "TIMESTAMP"),
+                    ("auth_source", "TEXT"),
+                    ("error_code", "TEXT"),
+                    ("upstream_status", "INTEGER"),
+                    ("attempt_index", "INTEGER DEFAULT 0"),
+                    ("request_fingerprint", "TEXT"),
+                    ("response_fingerprint", "TEXT"),
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -467,6 +492,54 @@ class Database:
                         try:
                             await db.execute(f"ALTER TABLE request_logs ADD COLUMN {col_name} {col_type}")
                             print(f"  ✓ Added column '{col_name}' to request_logs table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+            # Check and add missing columns to tasks table
+            if await self._table_exists(db, "tasks"):
+                columns_to_add = [
+                    ("retry_count", "INTEGER DEFAULT 0"),
+                    ("phase", "TEXT"),
+                    ("mutation_type", "TEXT"),
+                    ("execution_strategy", "TEXT"),
+                    ("profile_id", "TEXT"),
+                    ("window_id", "TEXT"),
+                    ("auth_refreshed_at", "TIMESTAMP"),
+                    ("auth_source", "TEXT"),
+                    ("error_code", "TEXT"),
+                    ("upstream_status", "INTEGER"),
+                    ("strategy_attempts", "TEXT"),
+                ]
+
+                for col_name, col_type in columns_to_add:
+                    if not await self._column_exists(db, "tasks", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to tasks table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+            # Check and add missing columns to tokens table
+            if await self._table_exists(db, "tokens"):
+                columns_to_add = [
+                    ("browser_profile_id", "TEXT"),
+                    ("browser_profile_path", "TEXT"),
+                    ("subscription_status", "TEXT"),
+                    ("sora_available", "BOOLEAN"),
+                    ("account_state", "TEXT"),
+                    ("account_state_reason", "TEXT"),
+                    ("source_of_truth", "TEXT"),
+                    ("last_auth_refresh_at", "TIMESTAMP"),
+                    ("last_browser_check_at", "TIMESTAMP"),
+                    ("last_quota_check_at", "TIMESTAMP"),
+                    ("last_auth_error_code", "TEXT"),
+                ]
+
+                for col_name, col_type in columns_to_add:
+                    if not await self._column_exists(db, "tokens", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to tokens table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
 
@@ -518,7 +591,18 @@ class Database:
                     image_concurrency INTEGER DEFAULT -1,
                     video_concurrency INTEGER DEFAULT -1,
                     is_expired BOOLEAN DEFAULT 0,
-                    disabled_reason TEXT
+                    disabled_reason TEXT,
+                    browser_profile_id TEXT,
+                    browser_profile_path TEXT,
+                    subscription_status TEXT,
+                    sora_available BOOLEAN,
+                    account_state TEXT,
+                    account_state_reason TEXT,
+                    source_of_truth TEXT,
+                    last_auth_refresh_at TIMESTAMP,
+                    last_browser_check_at TIMESTAMP,
+                    last_quota_check_at TIMESTAMP,
+                    last_auth_error_code TEXT
                 )
             """)
 
@@ -552,6 +636,17 @@ class Database:
                     progress FLOAT DEFAULT 0,
                     result_urls TEXT,
                     error_message TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    phase TEXT,
+                    mutation_type TEXT,
+                    execution_strategy TEXT,
+                    profile_id TEXT,
+                    window_id TEXT,
+                    auth_refreshed_at TIMESTAMP,
+                    auth_source TEXT,
+                    error_code TEXT,
+                    upstream_status INTEGER,
+                    strategy_attempts TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP,
                     FOREIGN KEY (token_id) REFERENCES tokens(id)
@@ -569,6 +664,18 @@ class Database:
                     response_body TEXT,
                     status_code INTEGER NOT NULL,
                     duration FLOAT NOT NULL,
+                    phase TEXT,
+                    mutation_type TEXT,
+                    execution_strategy TEXT,
+                    profile_id TEXT,
+                    window_id TEXT,
+                    auth_refreshed_at TIMESTAMP,
+                    auth_source TEXT,
+                    error_code TEXT,
+                    upstream_status INTEGER,
+                    attempt_index INTEGER DEFAULT 0,
+                    request_fingerprint TEXT,
+                    response_fingerprint TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP,
                     FOREIGN KEY (token_id) REFERENCES tokens(id)
@@ -782,8 +889,11 @@ class Database:
                 INSERT INTO tokens (token, email, username, name, st, rt, client_id, proxy_url, remark, expiry_time, is_active,
                                    plan_type, plan_title, subscription_end, sora2_supported, sora2_invite_code,
                                    sora2_redeemed_count, sora2_total_count, sora2_remaining_count, sora2_cooldown_until,
-                                   image_enabled, video_enabled, image_concurrency, video_concurrency)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   image_enabled, video_enabled, image_concurrency, video_concurrency,
+                                   browser_profile_id, browser_profile_path, subscription_status, sora_available,
+                                   account_state, account_state_reason, source_of_truth, last_auth_refresh_at,
+                                   last_browser_check_at, last_quota_check_at, last_auth_error_code)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.token, token.email, "", token.name, token.st, token.rt, token.client_id, token.proxy_url,
                   token.remark, token.expiry_time, token.is_active,
                   token.plan_type, token.plan_title, token.subscription_end,
@@ -791,7 +901,10 @@ class Database:
                   token.sora2_redeemed_count, token.sora2_total_count,
                   token.sora2_remaining_count, token.sora2_cooldown_until,
                   token.image_enabled, token.video_enabled,
-                  token.image_concurrency, token.video_concurrency))
+                  token.image_concurrency, token.video_concurrency,
+                  token.browser_profile_id, token.browser_profile_path, token.subscription_status, token.sora_available,
+                  token.account_state, token.account_state_reason, token.source_of_truth, token.last_auth_refresh_at,
+                  token.last_browser_check_at, token.last_quota_check_at, token.last_auth_error_code))
             await db.commit()
             token_id = cursor.lastrowid
 
@@ -931,6 +1044,34 @@ class Database:
                 UPDATE tokens SET cooled_until = ? WHERE id = ?
             """, (cooled_until, token_id))
             await db.commit()
+
+    async def update_token_account_snapshot(
+        self,
+        token_id: int,
+        *,
+        subscription_status: Optional[str] = None,
+        sora_available: Optional[bool] = None,
+        account_state: Optional[str] = None,
+        account_state_reason: Optional[str] = None,
+        source_of_truth: Optional[str] = None,
+        last_auth_refresh_at: Optional[datetime] = None,
+        last_browser_check_at: Optional[datetime] = None,
+        last_quota_check_at: Optional[datetime] = None,
+        last_auth_error_code: Optional[str] = None,
+    ):
+        """Update browser/auth/quota snapshot fields for a token."""
+        await self.update_token(
+            token_id,
+            subscription_status=subscription_status,
+            sora_available=sora_available,
+            account_state=account_state,
+            account_state_reason=account_state_reason,
+            source_of_truth=source_of_truth,
+            last_auth_refresh_at=last_auth_refresh_at,
+            last_browser_check_at=last_browser_check_at,
+            last_quota_check_at=last_quota_check_at,
+            last_auth_error_code=last_auth_error_code,
+        )
     
     async def delete_token(self, token_id: int):
         """Delete token"""
@@ -953,8 +1094,19 @@ class Database:
                           image_enabled: Optional[bool] = None,
                           video_enabled: Optional[bool] = None,
                           image_concurrency: Optional[int] = None,
-                          video_concurrency: Optional[int] = None):
-        """Update token (AT, ST, RT, client_id, proxy_url, remark, expiry_time, subscription info, image_enabled, video_enabled)"""
+                          video_concurrency: Optional[int] = None,
+                          browser_profile_id: Optional[str] = None,
+                          browser_profile_path: Optional[str] = None,
+                          subscription_status: Optional[str] = None,
+                          sora_available: Optional[bool] = None,
+                          account_state: Optional[str] = None,
+                          account_state_reason: Optional[str] = None,
+                          source_of_truth: Optional[str] = None,
+                          last_auth_refresh_at: Optional[datetime] = None,
+                          last_browser_check_at: Optional[datetime] = None,
+                          last_quota_check_at: Optional[datetime] = None,
+                          last_auth_error_code: Optional[str] = None):
+        """Update token fields, including browser profile binding and account snapshot data."""
         async with aiosqlite.connect(self.db_path) as db:
             # Build dynamic update query
             updates = []
@@ -1015,6 +1167,50 @@ class Database:
             if video_concurrency is not None:
                 updates.append("video_concurrency = ?")
                 params.append(video_concurrency)
+
+            if browser_profile_id is not None:
+                updates.append("browser_profile_id = ?")
+                params.append(browser_profile_id)
+
+            if browser_profile_path is not None:
+                updates.append("browser_profile_path = ?")
+                params.append(browser_profile_path)
+
+            if subscription_status is not None:
+                updates.append("subscription_status = ?")
+                params.append(subscription_status)
+
+            if sora_available is not None:
+                updates.append("sora_available = ?")
+                params.append(sora_available)
+
+            if account_state is not None:
+                updates.append("account_state = ?")
+                params.append(account_state)
+
+            if account_state_reason is not None:
+                updates.append("account_state_reason = ?")
+                params.append(account_state_reason)
+
+            if source_of_truth is not None:
+                updates.append("source_of_truth = ?")
+                params.append(source_of_truth)
+
+            if last_auth_refresh_at is not None:
+                updates.append("last_auth_refresh_at = ?")
+                params.append(last_auth_refresh_at)
+
+            if last_browser_check_at is not None:
+                updates.append("last_browser_check_at = ?")
+                params.append(last_browser_check_at)
+
+            if last_quota_check_at is not None:
+                updates.append("last_quota_check_at = ?")
+                params.append(last_quota_check_at)
+
+            if last_auth_error_code is not None:
+                updates.append("last_auth_error_code = ?")
+                params.append(last_auth_error_code)
 
             if updates:
                 params.append(token_id)
@@ -1162,22 +1358,73 @@ class Database:
         """Create a new task"""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
-                INSERT INTO tasks (task_id, token_id, model, prompt, status, progress)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (task.task_id, task.token_id, task.model, task.prompt, task.status, task.progress))
+                INSERT INTO tasks (
+                    task_id, token_id, model, prompt, status, progress, result_urls, error_message, retry_count,
+                    phase, mutation_type, execution_strategy, profile_id, window_id, auth_refreshed_at,
+                    auth_source, error_code, upstream_status, strategy_attempts
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                task.task_id,
+                task.token_id,
+                task.model,
+                task.prompt,
+                task.status,
+                task.progress,
+                task.result_urls,
+                task.error_message,
+                task.retry_count,
+                task.phase,
+                task.mutation_type,
+                task.execution_strategy,
+                task.profile_id,
+                task.window_id,
+                task.auth_refreshed_at,
+                task.auth_source,
+                task.error_code,
+                task.upstream_status,
+                task.strategy_attempts,
+            ))
             await db.commit()
             return cursor.lastrowid
     
     async def update_task(self, task_id: str, status: str, progress: float, 
-                         result_urls: Optional[str] = None, error_message: Optional[str] = None):
+                         result_urls: Optional[str] = None, error_message: Optional[str] = None,
+                         **metadata: Any):
         """Update task status"""
         async with aiosqlite.connect(self.db_path) as db:
             completed_at = datetime.now() if status in ["completed", "failed"] else None
-            await db.execute("""
-                UPDATE tasks 
-                SET status = ?, progress = ?, result_urls = ?, error_message = ?, completed_at = ?
-                WHERE task_id = ?
-            """, (status, progress, result_urls, error_message, completed_at, task_id))
+            updates = [
+                "status = ?",
+                "progress = ?",
+                "result_urls = ?",
+                "error_message = ?",
+                "completed_at = ?",
+            ]
+            params: List[Any] = [status, progress, result_urls, error_message, completed_at]
+
+            for key in (
+                "retry_count",
+                "phase",
+                "mutation_type",
+                "execution_strategy",
+                "profile_id",
+                "window_id",
+                "auth_refreshed_at",
+                "auth_source",
+                "error_code",
+                "upstream_status",
+                "strategy_attempts",
+            ):
+                if key in metadata and metadata[key] is not None:
+                    updates.append(f"{key} = ?")
+                    params.append(metadata[key])
+
+            params.append(task_id)
+            await db.execute(
+                f"UPDATE tasks SET {', '.join(updates)} WHERE task_id = ?",
+                params
+            )
             await db.commit()
     
     async def get_task(self, task_id: str) -> Optional[Task]:
@@ -1195,19 +1442,43 @@ class Database:
         """Log a request and return log ID"""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
-                INSERT INTO request_logs (token_id, task_id, operation, request_body, response_body, status_code, duration)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (log.token_id, log.task_id, log.operation, log.request_body, log.response_body,
-                  log.status_code, log.duration))
+                INSERT INTO request_logs (
+                    token_id, task_id, operation, request_body, response_body, status_code, duration,
+                    phase, mutation_type, execution_strategy, profile_id, window_id, auth_refreshed_at,
+                    auth_source, error_code, upstream_status, attempt_index, request_fingerprint, response_fingerprint
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                log.token_id,
+                log.task_id,
+                log.operation,
+                log.request_body,
+                log.response_body,
+                log.status_code,
+                log.duration,
+                log.phase,
+                log.mutation_type,
+                log.execution_strategy,
+                log.profile_id,
+                log.window_id,
+                log.auth_refreshed_at,
+                log.auth_source,
+                log.error_code,
+                log.upstream_status,
+                log.attempt_index,
+                log.request_fingerprint,
+                log.response_fingerprint,
+            ))
             await db.commit()
             return cursor.lastrowid
 
     async def update_request_log(self, log_id: int, response_body: Optional[str] = None,
-                                 status_code: Optional[int] = None, duration: Optional[float] = None):
+                                 status_code: Optional[int] = None, duration: Optional[float] = None,
+                                 **metadata: Any):
         """Update request log with completion data"""
         async with aiosqlite.connect(self.db_path) as db:
             updates = []
-            params = []
+            params: List[Any] = []
 
             if response_body is not None:
                 updates.append("response_body = ?")
@@ -1218,6 +1489,25 @@ class Database:
             if duration is not None:
                 updates.append("duration = ?")
                 params.append(duration)
+
+            for key in (
+                "phase",
+                "mutation_type",
+                "execution_strategy",
+                "profile_id",
+                "window_id",
+                "auth_refreshed_at",
+                "auth_source",
+                "error_code",
+                "upstream_status",
+                "attempt_index",
+                "request_fingerprint",
+                "response_fingerprint",
+                "task_id",
+            ):
+                if key in metadata and metadata[key] is not None:
+                    updates.append(f"{key} = ?")
+                    params.append(metadata[key])
 
             if updates:
                 updates.append("updated_at = CURRENT_TIMESTAMP")
@@ -1236,6 +1526,14 @@ class Database:
             """, (task_id, log_id))
             await db.commit()
 
+    async def get_request_log(self, log_id: int) -> Optional[dict]:
+        """Get a single request log row by ID."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM request_logs WHERE id = ?", (log_id,))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
     async def get_recent_logs(self, limit: int = 100) -> List[dict]:
         """Get recent logs with token email"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -1250,6 +1548,18 @@ class Database:
                     rl.response_body,
                     rl.status_code,
                     rl.duration,
+                    rl.phase,
+                    rl.mutation_type,
+                    rl.execution_strategy,
+                    rl.profile_id,
+                    rl.window_id,
+                    rl.auth_refreshed_at,
+                    rl.auth_source,
+                    rl.error_code,
+                    rl.upstream_status,
+                    rl.attempt_index,
+                    rl.request_fingerprint,
+                    rl.response_fingerprint,
                     rl.created_at,
                     t.email as token_email,
                     t.username as token_username

@@ -12,10 +12,13 @@ from .token_manager import TokenManager
 from .load_balancer import LoadBalancer
 from .file_cache import FileCache
 from .concurrency_manager import ConcurrencyManager
+from .mutation_executor import MutationExecutor
+from .browser_runtime import BrowserAuthError, UpstreamExecutionError
 from ..core.database import Database
 from ..core.models import Task, RequestLog
 from ..core.config import config
 from ..core.logger import debug_logger
+from ..core.sensitive import fingerprint_text, sanitize_value
 
 # Custom exception to carry token_id information
 class GenerationError(Exception):
@@ -232,12 +235,14 @@ class GenerationHandler:
 
     def __init__(self, sora_client: SoraClient, token_manager: TokenManager,
                  load_balancer: LoadBalancer, db: Database, proxy_manager=None,
-                 concurrency_manager: Optional[ConcurrencyManager] = None):
+                 concurrency_manager: Optional[ConcurrencyManager] = None,
+                 mutation_executor: Optional[MutationExecutor] = None):
         self.sora_client = sora_client
         self.token_manager = token_manager
         self.load_balancer = load_balancer
         self.db = db
         self.concurrency_manager = concurrency_manager
+        self.mutation_executor = mutation_executor
         self.file_cache = FileCache(
             cache_dir="tmp",
             default_timeout=config.cache_timeout,
@@ -265,6 +270,494 @@ class GenerationHandler:
         if "," in video_str:
             video_str = video_str.split(",", 1)[1]
         return base64.b64decode(video_str)
+
+    def _build_page_fetch_headers(self, auth_context) -> Dict[str, str]:
+        """Headers safe to set from page context during in-page fetch."""
+        headers = {
+            "Authorization": f"Bearer {auth_context.access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+        }
+        if auth_context.sentinel_token:
+            headers["openai-sentinel-token"] = auth_context.sentinel_token
+            headers["oai-language"] = "en-US"
+        if auth_context.device_id:
+            headers["oai-device-id"] = auth_context.device_id
+        return headers
+
+    def _build_video_submit_warmup_requests(self, prompt: str, auth_context) -> list[Dict[str, Any]]:
+        """Best-effort warmup requests that keep page fallback close to the browser path."""
+        base_headers = self._build_page_fetch_headers(auth_context)
+        backend_base = config.sora_base_url.rstrip("/")
+        sentinel_url = f"{self.sora_client.CHATGPT_BASE_URL}/backend-api/sentinel/req"
+        return [
+            {
+                "kind": "fetch",
+                "url": f"{backend_base}/authenticate",
+                "method": "GET",
+                "headers": base_headers,
+                "ignore_failure": True,
+            },
+            {
+                "kind": "refresh_sentinel",
+                "device_id": auth_context.device_id,
+                "apply_to_request": True,
+                "ignore_failure": True,
+            },
+            {
+                "kind": "fetch",
+                "url": sentinel_url,
+                "method": "POST",
+                "headers": base_headers,
+                "body": {},
+                "ignore_failure": True,
+            },
+            {
+                "kind": "fetch",
+                "url": f"{backend_base}/parameters",
+                "method": "GET",
+                "headers": base_headers,
+                "ignore_failure": True,
+            },
+            {
+                "kind": "fetch",
+                "url": f"{backend_base}/models?nf2=true",
+                "method": "GET",
+                "headers": base_headers,
+                "ignore_failure": True,
+            },
+            {
+                "kind": "fetch",
+                "url": f"{backend_base}/project_y/v2/me",
+                "method": "GET",
+                "headers": base_headers,
+                "ignore_failure": True,
+            },
+            {
+                "kind": "fetch",
+                "url": f"{backend_base}/project_y/initialize_async",
+                "method": "GET",
+                "headers": base_headers,
+                "ignore_failure": True,
+            },
+            {
+                "kind": "fetch",
+                "url": f"{backend_base}/nf/check",
+                "method": "GET",
+                "headers": base_headers,
+                "ignore_failure": True,
+            },
+            {
+                "kind": "fetch",
+                "url": f"{backend_base}/nf/moderate_prompt",
+                "method": "POST",
+                "headers": base_headers,
+                "body": {"prompt": prompt},
+                "ignore_failure": True,
+            },
+            {
+                "kind": "refresh_sentinel",
+                "device_id": auth_context.device_id,
+                "apply_to_request": True,
+                "ignore_failure": True,
+            },
+        ]
+
+    def _build_video_submit_page_request(
+        self,
+        prompt: str,
+        auth_context,
+        *,
+        payload: Dict[str, Any],
+        orientation: str,
+        media_id: Optional[str],
+        n_frames: int,
+        style_id: Optional[str],
+        sora_model: str,
+        video_size: str,
+    ) -> Dict[str, Any]:
+        """Use native UI click when the request matches the current default page controls."""
+        if (
+            not media_id
+            and not style_id
+            and orientation == "portrait"
+            and video_size == "small"
+            and sora_model == "sy_8"
+            and n_frames == 300
+        ):
+            return {
+                "_action": "ui_video_submit",
+                "target_url": "https://sora.chatgpt.com/explore",
+                "prompt": prompt,
+            }
+
+        return {
+            "target_url": "https://sora.chatgpt.com/explore",
+            "url": f"{config.sora_base_url}/nf/create",
+            "method": "POST",
+            "headers": self._build_page_fetch_headers(auth_context),
+            "body": payload,
+            "warmup_requests": self._build_video_submit_warmup_requests(prompt, auth_context),
+        }
+
+    def _extract_error_metadata(self, error: Exception) -> Dict[str, Any]:
+        """Normalize browser/upstream errors for task and log attribution."""
+        return {
+            "error_code": getattr(error, "code", getattr(error, "error_code", None)),
+            "upstream_status": getattr(error, "upstream_status", getattr(error, "status_code", None)),
+        }
+
+    def _build_mutation_metadata(self, mutation_result, phase: str, mutation_type: str) -> Dict[str, Any]:
+        """Convert mutation execution output into task/log metadata."""
+        return {
+            "phase": phase,
+            "mutation_type": mutation_type,
+            "execution_strategy": mutation_result.strategy,
+            "profile_id": mutation_result.profile_id,
+            "window_id": mutation_result.window_id,
+            "auth_refreshed_at": mutation_result.auth_context.refreshed_at,
+            "auth_source": mutation_result.auth_context.source,
+            "strategy_attempts": MutationExecutor.attempts_to_json(mutation_result),
+        }
+
+    @staticmethod
+    def _extract_task_id_from_mutation_raw_result(raw_result: Any) -> Optional[str]:
+        """Support both replay(str task_id) and page(dict payload) mutation results."""
+        if isinstance(raw_result, str):
+            return raw_result
+        if isinstance(raw_result, dict):
+            value = raw_result.get("id")
+            return str(value) if value is not None else None
+        return None
+
+    async def _finalize_request_log_success(
+        self,
+        log_id: Optional[int],
+        start_time: Optional[float],
+        task_id: str,
+        result_urls: list[str],
+    ):
+        """Finalize the request log as a successful terminal result."""
+        if not log_id or start_time is None:
+            return
+
+        await self.db.update_request_log(
+            log_id,
+            response_body=json.dumps(
+                {
+                    "task_id": task_id,
+                    "status": "success",
+                    "result_urls": result_urls,
+                }
+            ),
+            status_code=200,
+            duration=time.time() - start_time,
+        )
+
+    async def _finalize_request_log_failure(
+        self,
+        log_id: Optional[int],
+        start_time: Optional[float],
+        error_message: str,
+        *,
+        status_code: int = 500,
+    ):
+        """Finalize the request log for terminal failures that return from polling."""
+        if not log_id or start_time is None:
+            return
+
+        await self.db.update_request_log(
+            log_id,
+            response_body=json.dumps({"error": error_message}),
+            status_code=status_code,
+            duration=time.time() - start_time,
+        )
+
+    async def _execute_page_backed_mutation(
+        self,
+        token_obj,
+        *,
+        mutation_type: str,
+        target_url: str,
+        replay_callable,
+        page_request_builder,
+        error_message: str,
+    ):
+        """Run a high-risk mutation through the strategy executor."""
+        if not self.mutation_executor or not token_obj.browser_profile_path:
+            return None
+
+        async def replay(session):
+            return await replay_callable(session)
+
+        async def page(session):
+            request_payload = page_request_builder(session)
+            action = request_payload.pop("_action", "json_fetch")
+            response = await session.execute_in_page(action, request_payload)
+            payload = self.mutation_executor.ensure_ok_response(response, error_message)
+            return payload.get("json") or {}
+
+        return await self.mutation_executor.execute(
+            token_obj,
+            mutation_type=mutation_type,
+            target_url=target_url,
+            replay_callable=replay,
+            page_callable=page,
+        )
+
+    async def _execute_video_submit(
+        self,
+        token_obj,
+        *,
+        prompt: str,
+        orientation: str,
+        media_id: Optional[str],
+        n_frames: int,
+        style_id: Optional[str],
+        sora_model: str,
+        video_size: str,
+    ):
+        inpaint_items = []
+        if media_id:
+            inpaint_items = [{"kind": "upload", "upload_id": media_id}]
+
+        payload = self.sora_client._build_video_payload(
+            prompt,
+            orientation=orientation,
+            size=video_size,
+            n_frames=n_frames,
+            model=sora_model,
+            inpaint_items=inpaint_items,
+            style_id=style_id,
+        )
+
+        result = await self._execute_page_backed_mutation(
+            token_obj,
+            mutation_type="video_submit",
+            target_url="https://sora.chatgpt.com/explore",
+            replay_callable=lambda session: self.sora_client.generate_video(
+                prompt,
+                token_obj.token,
+                orientation=orientation,
+                media_id=media_id,
+                n_frames=n_frames,
+                style_id=style_id,
+                model=sora_model,
+                size=video_size,
+                token_id=token_obj.id,
+                auth_context=session.auth_context,
+            ),
+            page_request_builder=lambda session: self._build_video_submit_page_request(
+                prompt,
+                session.auth_context,
+                payload=payload,
+                orientation=orientation,
+                media_id=media_id,
+                n_frames=n_frames,
+                style_id=style_id,
+                sora_model=sora_model,
+                video_size=video_size,
+            ),
+            error_message="Video submit failed",
+        )
+        return result
+
+    async def _execute_image_submit(self, token_obj, *, prompt: str, width: int, height: int, media_id: Optional[str]):
+        inpaint_items = []
+        if media_id:
+            inpaint_items = [{
+                "type": "image",
+                "frame_index": 0,
+                "upload_media_id": media_id
+            }]
+        payload = {
+            "type": "image_gen",
+            "operation": "remix" if media_id else "simple_compose",
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "n_variants": 1,
+            "n_frames": 1,
+            "inpaint_items": inpaint_items,
+        }
+
+        return await self._execute_page_backed_mutation(
+            token_obj,
+            mutation_type="image_submit",
+            target_url="https://sora.chatgpt.com/explore",
+            replay_callable=lambda session: self.sora_client.generate_image(
+                prompt,
+                token_obj.token,
+                width=width,
+                height=height,
+                media_id=media_id,
+                token_id=token_obj.id,
+                auth_context=session.auth_context,
+            ),
+            page_request_builder=lambda session: {
+                "target_url": "https://sora.chatgpt.com/explore",
+                "url": f"{config.sora_base_url}/video_gen",
+                "method": "POST",
+                "headers": self._build_page_fetch_headers(session.auth_context),
+                "body": payload,
+            },
+            error_message="Image submit failed",
+        )
+
+    async def _execute_storyboard_submit(
+        self,
+        token_obj,
+        *,
+        prompt: str,
+        orientation: str,
+        media_id: Optional[str],
+        n_frames: int,
+        style_id: Optional[str],
+    ):
+        inpaint_items = []
+        if media_id:
+            inpaint_items = [{"kind": "upload", "upload_id": media_id}]
+        payload = {
+            "kind": "video",
+            "prompt": prompt,
+            "title": "Draft your video",
+            "orientation": orientation,
+            "size": "small",
+            "n_frames": n_frames,
+            "storyboard_id": None,
+            "inpaint_items": inpaint_items,
+            "remix_target_id": None,
+            "model": "sy_8",
+            "metadata": None,
+            "style_id": style_id,
+            "cameo_ids": None,
+            "cameo_replacements": None,
+            "audio_caption": None,
+            "audio_transcript": None,
+            "video_caption": None,
+        }
+        return await self._execute_page_backed_mutation(
+            token_obj,
+            mutation_type="storyboard_submit",
+            target_url="https://sora.chatgpt.com/explore",
+            replay_callable=lambda session: self.sora_client.generate_storyboard(
+                prompt,
+                token_obj.token,
+                orientation=orientation,
+                media_id=media_id,
+                n_frames=n_frames,
+                style_id=style_id,
+                token_id=token_obj.id,
+                auth_context=session.auth_context,
+            ),
+            page_request_builder=lambda session: {
+                "target_url": "https://sora.chatgpt.com/explore",
+                "url": f"{config.sora_base_url}/nf/create/storyboard",
+                "method": "POST",
+                "headers": self._build_page_fetch_headers(session.auth_context),
+                "body": payload,
+            },
+            error_message="Storyboard submit failed",
+        )
+
+    async def _execute_remix_submit(
+        self,
+        token_obj,
+        *,
+        remix_target_id: str,
+        prompt: str,
+        orientation: str,
+        n_frames: int,
+        style_id: Optional[str],
+    ):
+        payload = self.sora_client._build_video_payload(
+            prompt,
+            orientation=orientation,
+            size="small",
+            n_frames=n_frames,
+            model="sy_8",
+            inpaint_items=[],
+            style_id=style_id,
+            remix_target_id=remix_target_id,
+        )
+        return await self._execute_page_backed_mutation(
+            token_obj,
+            mutation_type="remix_submit",
+            target_url="https://sora.chatgpt.com/explore",
+            replay_callable=lambda session: self.sora_client.remix_video(
+                remix_target_id,
+                prompt,
+                token_obj.token,
+                orientation=orientation,
+                n_frames=n_frames,
+                style_id=style_id,
+                token_id=token_obj.id,
+                auth_context=session.auth_context,
+            ),
+            page_request_builder=lambda session: {
+                "target_url": "https://sora.chatgpt.com/explore",
+                "url": f"{config.sora_base_url}/nf/create",
+                "method": "POST",
+                "headers": self._build_page_fetch_headers(session.auth_context),
+                "body": payload,
+            },
+            error_message="Remix submit failed",
+        )
+
+    async def _execute_extension_submit(
+        self,
+        token_obj,
+        *,
+        generation_id: str,
+        prompt: str,
+        extension_duration_s: int,
+    ):
+        payload = {
+            "user_prompt": prompt,
+            "extension_duration_s": extension_duration_s,
+            "enable_rewrite": True,
+        }
+        draft_url = f"https://sora.chatgpt.com/d/{generation_id}"
+        return await self._execute_page_backed_mutation(
+            token_obj,
+            mutation_type="long_video_extension",
+            target_url=draft_url,
+            replay_callable=lambda session: self.sora_client.extend_video(
+                generation_id,
+                prompt,
+                extension_duration_s,
+                token_obj.token,
+                token_id=token_obj.id,
+                auth_context=session.auth_context,
+            ),
+            page_request_builder=lambda session: {
+                "target_url": draft_url,
+                "url": f"{config.sora_base_url}/project_y/profile/drafts/{generation_id}/long_video_extension",
+                "method": "POST",
+                "headers": self._build_page_fetch_headers(session.auth_context),
+                "body": payload,
+            },
+            error_message="Long video extension failed",
+        )
+
+    async def _execute_publish(self, token_obj, *, generation_id: str):
+        if not self.mutation_executor or not token_obj.browser_profile_path:
+            return None
+
+        draft_url = f"https://sora.chatgpt.com/d/{generation_id}"
+
+        async def page(session):
+            response = await session.execute_in_page("publish_click", {"draft_url": draft_url})
+            payload = self.mutation_executor.ensure_ok_response(response, "Publish execute failed")
+            return payload.get("json") or {}
+
+        return await self.mutation_executor.execute(
+            token_obj,
+            mutation_type="publish_execute",
+            target_url=draft_url,
+            replay_callable=None,
+            page_callable=page,
+        )
 
     def _should_retry_on_error(self, error: Exception) -> bool:
         """判断错误是否应该触发重试
@@ -586,6 +1079,7 @@ class GenerationHandler:
         is_first_chunk = True  # Track if this is the first chunk
         log_id = None  # Initialize log_id
         log_updated = False  # Track if log has been updated
+        submit_result = None
 
         try:
             # Create initial log entry BEFORE submitting task to upstream
@@ -653,52 +1147,109 @@ class GenerationHandler:
                     formatted_prompt = self.sora_client.format_storyboard_prompt(clean_prompt)
                     debug_logger.log_info(f"Storyboard mode detected. Formatted prompt: {formatted_prompt}")
 
-                    task_id = await self.sora_client.generate_storyboard(
-                        formatted_prompt, token_obj.token,
+                    submit_result = await self._execute_storyboard_submit(
+                        token_obj,
+                        prompt=formatted_prompt,
                         orientation=model_config["orientation"],
                         media_id=media_id,
                         n_frames=n_frames,
-                        style_id=style_id
+                        style_id=style_id,
                     )
+                    if submit_result:
+                        task_id = self._extract_task_id_from_mutation_raw_result(submit_result.raw_result)
+                    else:
+                        task_id = await self.sora_client.generate_storyboard(
+                            formatted_prompt, token_obj.token,
+                            orientation=model_config["orientation"],
+                            media_id=media_id,
+                            n_frames=n_frames,
+                            style_id=style_id,
+                            token_id=token_obj.id,
+                        )
                 else:
                     # Normal video generation
                     # Get model and size from config (default to sy_8 and small for backward compatibility)
                     sora_model = model_config.get("model", "sy_8")
                     video_size = model_config.get("size", "small")
 
-                    task_id = await self.sora_client.generate_video(
-                        clean_prompt, token_obj.token,
+                    submit_result = await self._execute_video_submit(
+                        token_obj,
+                        prompt=clean_prompt,
                         orientation=model_config["orientation"],
                         media_id=media_id,
                         n_frames=n_frames,
                         style_id=style_id,
-                        model=sora_model,
-                        size=video_size,
-                        token_id=token_obj.id
+                        sora_model=sora_model,
+                        video_size=video_size,
                     )
+                    if submit_result:
+                        task_id = self._extract_task_id_from_mutation_raw_result(submit_result.raw_result)
+                    else:
+                        task_id = await self.sora_client.generate_video(
+                            clean_prompt, token_obj.token,
+                            orientation=model_config["orientation"],
+                            media_id=media_id,
+                            n_frames=n_frames,
+                            style_id=style_id,
+                            model=sora_model,
+                            size=video_size,
+                            token_id=token_obj.id
+                        )
             else:
-                task_id = await self.sora_client.generate_image(
-                    prompt, token_obj.token,
+                submit_result = await self._execute_image_submit(
+                    token_obj,
+                    prompt=prompt,
                     width=model_config["width"],
                     height=model_config["height"],
                     media_id=media_id,
-                    token_id=token_obj.id
                 )
+                if submit_result:
+                    task_id = self._extract_task_id_from_mutation_raw_result(submit_result.raw_result)
+                else:
+                    task_id = await self.sora_client.generate_image(
+                        prompt, token_obj.token,
+                        width=model_config["width"],
+                        height=model_config["height"],
+                        media_id=media_id,
+                        token_id=token_obj.id
+                    )
+
+            if not task_id:
+                raise Exception("Mutation completed without returning a task_id")
 
             # Save task to database
+            task_metadata = self._build_mutation_metadata(
+                submit_result,
+                "submit_phase",
+                "video_submit" if is_video else "image_submit",
+            ) if submit_result else {}
             task = Task(
                 task_id=task_id,
                 token_id=token_obj.id,
                 model=model,
                 prompt=prompt,
                 status="processing",
-                progress=0.0
+                progress=0.0,
+                **task_metadata
             )
             await self.db.create_task(task)
 
             # Update log entry with task_id now that we have it
             if log_id:
-                await self.db.update_request_log_task_id(log_id, task_id)
+                if submit_result:
+                    await self.db.update_request_log(
+                        log_id,
+                        task_id=task_id,
+                        phase="submit_phase",
+                        mutation_type="video_submit" if is_video else "image_submit",
+                        execution_strategy=submit_result.strategy,
+                        profile_id=submit_result.profile_id,
+                        window_id=submit_result.window_id,
+                        auth_refreshed_at=submit_result.auth_context.refreshed_at,
+                        auth_source=submit_result.auth_context.source,
+                    )
+                else:
+                    await self.db.update_request_log_task_id(log_id, task_id)
 
             # Record usage
             await self.token_manager.record_usage(token_obj.id, is_video=is_video)
@@ -787,6 +1338,7 @@ class GenerationHandler:
 
             # Update log entry with error data
             duration = time.time() - start_time
+            error_metadata = self._extract_error_metadata(e)
             if log_id:
                 if error_response:
                     # Structured error (e.g., unsupported_country_code, cf_shield_429)
@@ -795,7 +1347,9 @@ class GenerationHandler:
                         log_id,
                         response_body=json.dumps(error_response),
                         status_code=status_code,
-                        duration=duration
+                        duration=duration,
+                        error_code=error_metadata["error_code"],
+                        upstream_status=error_metadata["upstream_status"],
                     )
                     log_updated = True  # Mark log as updated
                 else:
@@ -804,7 +1358,9 @@ class GenerationHandler:
                         log_id,
                         response_body=json.dumps({"error": str(e)}),
                         status_code=500,
-                        duration=duration
+                        duration=duration,
+                        error_code=error_metadata["error_code"],
+                        upstream_status=error_metadata["upstream_status"],
                     )
                     log_updated = True  # Mark log as updated
             # Wrap exception with token_id information
@@ -818,15 +1374,17 @@ class GenerationHandler:
             # This prevents logs from being stuck at status_code = -1
             if log_id and not log_updated:
                 try:
-                    # Log was not updated in try or except blocks, update it now
-                    duration = time.time() - start_time
-                    await self.db.update_request_log(
-                        log_id,
-                        response_body=json.dumps({"error": "Task failed or interrupted during processing"}),
-                        status_code=500,
-                        duration=duration
-                    )
-                    debug_logger.log_info(f"Updated stuck log entry {log_id} from status -1 to 500 in finally block")
+                    current_log = await self.db.get_request_log(log_id)
+                    if not current_log or current_log.get("status_code") == -1:
+                        # Log was not updated in try or except blocks, update it now
+                        duration = time.time() - start_time
+                        await self.db.update_request_log(
+                            log_id,
+                            response_body=json.dumps({"error": "Task failed or interrupted during processing"}),
+                            status_code=500,
+                            duration=duration
+                        )
+                        debug_logger.log_info(f"Updated stuck log entry {log_id} from status -1 to 500 in finally block")
                 except Exception as finally_error:
                     # Don't let finally block errors break the flow
                     debug_logger.log_error(
@@ -1064,6 +1622,12 @@ class GenerationHandler:
 
                                     # Update task status
                                     await self.db.update_task(task_id, "failed", 0, error_message=error_message)
+                                    await self._finalize_request_log_failure(
+                                        log_id,
+                                        start_time,
+                                        error_message,
+                                        status_code=400,
+                                    )
 
                                     # Release resources
                                     if token_id and self.concurrency_manager:
@@ -1110,13 +1674,56 @@ class GenerationHandler:
                                     parse_method = watermark_config.parse_method or "third_party"
 
                                     # Post video to get watermark-free version
+                                    publish_log_id = None
                                     try:
                                         debug_logger.log_info(f"Calling post_video_for_watermark_free with generation_id={generation_id}, prompt={prompt[:50]}...")
-                                        post_id = await self.sora_client.post_video_for_watermark_free(
-                                            generation_id=generation_id,
-                                            prompt=prompt,
-                                            token=token
+                                        publish_log_id = await self._log_request(
+                                            token_id,
+                                            "publish_execute",
+                                            {
+                                                "generation_id": generation_id,
+                                                "has_prompt": bool(prompt),
+                                            },
+                                            {},
+                                            -1,
+                                            -1.0,
+                                            task_id=task_id,
+                                            phase="publish_phase",
+                                            mutation_type="publish_execute",
                                         )
+
+                                        publish_result = None
+                                        token_obj = await self.db.get_token(token_id) if token_id else None
+                                        if token_obj:
+                                            publish_result = await self._execute_publish(token_obj, generation_id=generation_id)
+
+                                        if publish_result:
+                                            post_id = (publish_result.raw_result.get("post") or {}).get("id", "")
+                                            if publish_log_id:
+                                                await self.db.update_request_log(
+                                                    publish_log_id,
+                                                    response_body=json.dumps({"post_id": post_id}),
+                                                    status_code=200,
+                                                    duration=0.0,
+                                                    execution_strategy=publish_result.strategy,
+                                                    profile_id=publish_result.profile_id,
+                                                    window_id=publish_result.window_id,
+                                                    auth_refreshed_at=publish_result.auth_context.refreshed_at,
+                                                    auth_source=publish_result.auth_context.source,
+                                                )
+                                        else:
+                                            post_id = await self.sora_client.post_video_for_watermark_free(
+                                                generation_id=generation_id,
+                                                prompt=prompt,
+                                                token=token
+                                            )
+                                            if publish_log_id:
+                                                await self.db.update_request_log(
+                                                    publish_log_id,
+                                                    response_body=json.dumps({"post_id": post_id}),
+                                                    status_code=200,
+                                                    duration=0.0,
+                                                )
                                         debug_logger.log_info(f"Received post_id: {post_id}")
 
                                         if not post_id:
@@ -1198,6 +1805,16 @@ class GenerationHandler:
                                     except Exception as publish_error:
                                         # Watermark-free mode failed
                                         watermark_free_failed = True
+                                        if publish_log_id:
+                                            publish_error_metadata = self._extract_error_metadata(publish_error)
+                                            await self.db.update_request_log(
+                                                publish_log_id,
+                                                response_body=json.dumps({"error": str(publish_error)}),
+                                                status_code=500,
+                                                duration=0.0,
+                                                error_code=publish_error_metadata["error_code"],
+                                                upstream_status=publish_error_metadata["upstream_status"],
+                                            )
                                         import traceback
                                         error_traceback = traceback.format_exc()
                                         debug_logger.log_error(
@@ -1276,6 +1893,12 @@ class GenerationHandler:
                                     task_id, "completed", 100.0,
                                     result_urls=json.dumps([local_url])
                                 )
+                                await self._finalize_request_log_success(
+                                    log_id,
+                                    start_time,
+                                    task_id,
+                                    [local_url],
+                                )
 
                                 if stream:
                                     # Final response with content
@@ -1346,6 +1969,12 @@ class GenerationHandler:
                                     await self.db.update_task(
                                         task_id, "completed", 100.0,
                                         result_urls=json.dumps(local_urls)
+                                    )
+                                    await self._finalize_request_log_success(
+                                        log_id,
+                                        start_time,
+                                        task_id,
+                                        local_urls,
                                     )
 
                                     if stream:
@@ -1567,22 +2196,28 @@ class GenerationHandler:
 
     async def _log_request(self, token_id: Optional[int], operation: str,
                           request_data: Dict[str, Any], response_data: Dict[str, Any],
-                          status_code: int, duration: float, task_id: Optional[str] = None) -> Optional[int]:
+                          status_code: int, duration: float, task_id: Optional[str] = None,
+                          **metadata: Any) -> Optional[int]:
         """Log request to database and return log ID"""
         try:
+            sanitized_request = sanitize_value(request_data)
+            sanitized_response = sanitize_value(response_data)
             log = RequestLog(
                 token_id=token_id,
                 task_id=task_id,
                 operation=operation,
-                request_body=json.dumps(request_data),
-                response_body=json.dumps(response_data),
+                request_body=json.dumps(sanitized_request, ensure_ascii=False, default=str),
+                response_body=json.dumps(sanitized_response, ensure_ascii=False, default=str),
                 status_code=status_code,
-                duration=duration
+                duration=duration,
+                request_fingerprint=fingerprint_text(sanitized_request),
+                response_fingerprint=fingerprint_text(sanitized_response),
+                **metadata,
             )
             return await self.db.log_request(log)
         except Exception as e:
             # Don't fail the request if logging fails
-            print(f"Failed to log request: {e}")
+            debug_logger.log_warning(f"[Generation] failed to persist request log: {e}")
             return None
 
     # ==================== Prompt Enhancement Handler ====================
@@ -2282,6 +2917,7 @@ class GenerationHandler:
             raise Exception("No available tokens for remix generation")
 
         task_id = None
+        submit_result = None
         try:
             yield self._format_stream_chunk(
                 reasoning_content="**Remix Generation Process Begins**\n\nInitializing remix request...\n",
@@ -2301,24 +2937,42 @@ class GenerationHandler:
             yield self._format_stream_chunk(
                 reasoning_content="Sending remix request to server...\n"
             )
-            task_id = await self.sora_client.remix_video(
+            submit_result = await self._execute_remix_submit(
+                token_obj,
                 remix_target_id=remix_target_id,
                 prompt=clean_prompt,
-                token=token_obj.token,
                 orientation=model_config["orientation"],
                 n_frames=n_frames,
-                style_id=style_id
+                style_id=style_id,
             )
+            if submit_result:
+                task_id = submit_result.raw_result.get("id")
+            else:
+                task_id = await self.sora_client.remix_video(
+                    remix_target_id=remix_target_id,
+                    prompt=clean_prompt,
+                    token=token_obj.token,
+                    orientation=model_config["orientation"],
+                    n_frames=n_frames,
+                    style_id=style_id,
+                    token_id=token_obj.id,
+                )
             debug_logger.log_info(f"Remix generation started, task_id: {task_id}")
 
             # Save task to database
+            task_metadata = self._build_mutation_metadata(
+                submit_result,
+                "submit_phase",
+                "remix_submit",
+            ) if submit_result else {}
             task = Task(
                 task_id=task_id,
                 token_id=token_obj.id,
                 model=f"sora2-video-{model_config['orientation']}",
                 prompt=f"remix:{remix_target_id} {clean_prompt}",
                 status="processing",
-                progress=0.0
+                progress=0.0,
+                **task_metadata,
             )
             await self.db.create_task(task)
 
@@ -2368,6 +3022,7 @@ class GenerationHandler:
             raise Exception("No available tokens for video extension generation")
 
         task_id = None
+        submit_result = None
         start_time = time.time()
         log_id = None
         log_updated = False
@@ -2408,26 +3063,54 @@ class GenerationHandler:
                 )
             )
 
-            task_id = await self.sora_client.extend_video(
+            submit_result = await self._execute_extension_submit(
+                token_obj,
                 generation_id=generation_id,
                 prompt=clean_prompt,
                 extension_duration_s=extension_duration_s,
-                token=token_obj.token,
-                token_id=token_obj.id
             )
+            if submit_result:
+                task_id = submit_result.raw_result.get("id")
+            else:
+                task_id = await self.sora_client.extend_video(
+                    generation_id=generation_id,
+                    prompt=clean_prompt,
+                    extension_duration_s=extension_duration_s,
+                    token=token_obj.token,
+                    token_id=token_obj.id
+                )
             debug_logger.log_info(f"Video extension started, task_id: {task_id}")
 
+            task_metadata = self._build_mutation_metadata(
+                submit_result,
+                "submit_phase",
+                "long_video_extension",
+            ) if submit_result else {}
             task = Task(
                 task_id=task_id,
                 token_id=token_obj.id,
                 model=model_name,
                 prompt=f"extend:{generation_id} {clean_prompt}",
                 status="processing",
-                progress=0.0
+                progress=0.0,
+                **task_metadata,
             )
             await self.db.create_task(task)
             if log_id:
-                await self.db.update_request_log_task_id(log_id, task_id)
+                if submit_result:
+                    await self.db.update_request_log(
+                        log_id,
+                        task_id=task_id,
+                        phase="submit_phase",
+                        mutation_type="long_video_extension",
+                        execution_strategy=submit_result.strategy,
+                        profile_id=submit_result.profile_id,
+                        window_id=submit_result.window_id,
+                        auth_refreshed_at=submit_result.auth_context.refreshed_at,
+                        auth_source=submit_result.auth_context.source,
+                    )
+                else:
+                    await self.db.update_request_log_task_id(log_id, task_id)
 
             await self.token_manager.record_usage(token_obj.id, is_video=True)
 

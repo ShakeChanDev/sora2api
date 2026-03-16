@@ -19,6 +19,8 @@ from .proxy_manager import ProxyManager
 from .pow_service_client import pow_service_client
 from ..core.config import config
 from ..core.logger import debug_logger
+from ..core.sensitive import fingerprint_text
+from .browser_runtime import AuthContext, UpstreamExecutionError
 
 try:
     from playwright.async_api import async_playwright
@@ -167,14 +169,14 @@ async def _fetch_oai_did(
                 
                 oai_did = response.cookies.get("oai-did")
                 if oai_did:
-                    debug_logger.log_info(f"[Sentinel] oai-did: {oai_did}")
+                    debug_logger.log_info(f"[Sentinel] oai-did fingerprint={fingerprint_text(oai_did)}")
                     return oai_did
                 
                 set_cookie = response.headers.get("set-cookie", "")
                 match = re.search(r'oai-did=([a-f0-9-]{36})', set_cookie)
                 if match:
                     oai_did = match.group(1)
-                    debug_logger.log_info(f"[Sentinel] oai-did: {oai_did}")
+                    debug_logger.log_info(f"[Sentinel] oai-did fingerprint={fingerprint_text(oai_did)}")
                     return oai_did
                     
         except Exception as e:
@@ -513,6 +515,67 @@ class SoraClient:
         self.timeout = config.sora_timeout
 
     @staticmethod
+    def _build_video_payload(
+        prompt: str,
+        *,
+        orientation: str,
+        size: str,
+        n_frames: int,
+        model: str,
+        inpaint_items: list,
+        style_id: Optional[str],
+        remix_target_id: Optional[str] = None,
+        title: Optional[str] = None,
+        storyboard_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a native-like payload for /backend/nf/create."""
+        return {
+            "kind": "video",
+            "prompt": prompt,
+            "title": title,
+            "orientation": orientation,
+            "size": size,
+            "n_frames": n_frames,
+            "inpaint_items": inpaint_items,
+            "remix_target_id": remix_target_id,
+            "reroll_target_id": None,
+            "project_config": None,
+            "trim_config": None,
+            "metadata": None,
+            "cameo_ids": None,
+            "cameo_replacements": None,
+            "model": model,
+            "style_id": style_id,
+            "audio_caption": None,
+            "audio_transcript": None,
+            "video_caption": None,
+            "storyboard_id": storyboard_id,
+        }
+
+    def _headers_from_auth_context(
+        self,
+        auth_context: AuthContext,
+        *,
+        add_sentinel_token: bool = False,
+        referer: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Build replay headers from a page-derived auth context."""
+        headers = {
+            "Authorization": f"Bearer {auth_context.access_token}",
+            "User-Agent": auth_context.user_agent,
+            "Origin": "https://sora.chatgpt.com",
+            "Referer": referer or "https://sora.chatgpt.com/explore",
+        }
+        if auth_context.cookie_header:
+            headers["Cookie"] = auth_context.cookie_header
+        if auth_context.device_id:
+            headers["oai-device-id"] = auth_context.device_id
+        if add_sentinel_token and auth_context.sentinel_token:
+            headers["openai-sentinel-token"] = auth_context.sentinel_token
+            headers["oai-language"] = "en-US"
+        return headers
+
+    @staticmethod
     def _get_pow_parse_time() -> str:
         """Generate time string for PoW (local timezone)"""
         now = datetime.now()
@@ -646,11 +709,21 @@ class SoraClient:
 
             resp_text = resp.read().decode("utf-8")
             if resp.status not in (200, 201):
-                raise Exception(f"Request failed: {resp.status} {resp_text}")
+                raise UpstreamExecutionError(
+                    f"Request failed: {resp.status} {resp_text}",
+                    status_code=resp.status,
+                    response_body=resp_text,
+                    high_risk=resp.status in {401, 403},
+                )
             return json.loads(resp_text)
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
-            raise Exception(f"HTTP Error: {exc.code} {body}") from exc
+            raise UpstreamExecutionError(
+                f"HTTP Error: {exc.code} {body}",
+                status_code=exc.code,
+                response_body=body,
+                high_risk=exc.code in {401, 403},
+            ) from exc
         except URLError as exc:
             raise Exception(f"URL Error: {exc}") from exc
 
@@ -688,9 +761,9 @@ class SoraClient:
                 
                 if not device_id:
                     device_id = str(uuid4())
-                    debug_logger.log_info(f"[Browser] No oai-did cookie, generated: {device_id}")
+                    debug_logger.log_info(f"[Browser] No oai-did cookie, generated fingerprint={fingerprint_text(device_id)}")
                 else:
-                    debug_logger.log_info(f"[Browser] Got oai-did from cookie: {device_id}")
+                    debug_logger.log_info(f"[Browser] Got oai-did fingerprint={fingerprint_text(device_id)}")
                 
                 debug_logger.log_info(f"[Browser] Waiting for SentinelSDK...")
                 for _ in range(120):
@@ -812,7 +885,7 @@ class SoraClient:
         # 添加 Cookie 头（关键修复）
         if cookie_header:
             headers["Cookie"] = cookie_header
-            debug_logger.log_info(f"[nf/create] Using cookie header from POW service (length: {len(cookie_header)})")
+            debug_logger.log_info(f"[nf/create] Using cookie header (length: {len(cookie_header)})")
         elif token_id:
             try:
                 from src.core.database import Database
@@ -829,16 +902,8 @@ class SoraClient:
 
         # 记录详细的 Sentinel Token 信息
         debug_logger.log_info(f"[nf/create] Preparing request to {url}")
-        debug_logger.log_info(f"[nf/create] Device ID: {device_id}")
-
-        # Sentinel Token 前100字符和后50字符
-        if len(sentinel_token) > 150:
-            debug_logger.log_info(f"[nf/create] Sentinel Token (first 100 chars): {sentinel_token[:100]}...")
-            debug_logger.log_info(f"[nf/create] Sentinel Token (last 50 chars): ...{sentinel_token[-50:]}")
-        else:
-            debug_logger.log_info(f"[nf/create] Sentinel Token: {sentinel_token}")
-
-        debug_logger.log_info(f"[nf/create] Sentinel Token length: {len(sentinel_token)}")
+        debug_logger.log_info(f"[nf/create] Device ID fingerprint: {fingerprint_text(device_id)}")
+        debug_logger.log_info(f"[nf/create] Sentinel fingerprint: {fingerprint_text(sentinel_token)} length={len(sentinel_token)}")
 
         # Sentinel Token 结构信息
         debug_logger.log_info(f"[nf/create] Sentinel Token structure:")
@@ -849,7 +914,7 @@ class SoraClient:
         if "c" in sentinel_data:
             debug_logger.log_info(f"  - c (Challenge) length: {len(sentinel_data['c'])}")
         if "id" in sentinel_data:
-            debug_logger.log_info(f"  - id: {sentinel_data['id']}")
+            debug_logger.log_info(f"  - id fingerprint: {fingerprint_text(sentinel_data['id'])}")
         if "flow" in sentinel_data:
             debug_logger.log_info(f"  - flow: {sentinel_data['flow']}")
 
@@ -893,11 +958,21 @@ class SoraClient:
 
             resp_text = resp.read().decode("utf-8")
             if resp.status not in (200, 201):
-                raise Exception(f"Request failed: {resp.status} {resp_text}")
+                raise UpstreamExecutionError(
+                    f"Request failed: {resp.status} {resp_text}",
+                    status_code=resp.status,
+                    response_body=resp_text,
+                    high_risk=resp.status in {401, 403},
+                )
             return json.loads(resp_text)
         except HTTPError as exc:
             body_text = exc.read().decode("utf-8", errors="ignore")
-            raise Exception(f"HTTP Error: {exc.code} {body_text}") from exc
+            raise UpstreamExecutionError(
+                f"HTTP Error: {exc.code} {body_text}",
+                status_code=exc.code,
+                response_body=body_text,
+                high_risk=exc.code in {401, 403},
+            ) from exc
         except URLError as exc:
             raise Exception(f"URL Error: {exc}") from exc
 
@@ -1015,7 +1090,10 @@ class SoraClient:
 
         # Log final token for debugging
         parsed = json.loads(sentinel_token)
-        debug_logger.log_info(f"Final sentinel: p_prefix={parsed['p'][:10]}, p_suffix={parsed['p'][-5:]}, t_len={len(parsed['t'])}, c_len={len(parsed['c'])}, flow={parsed['flow']}")
+        debug_logger.log_info(
+            f"Final sentinel generated: p_len={len(parsed['p'])}, t_len={len(parsed['t'])}, "
+            f"c_len={len(parsed['c'])}, flow={parsed['flow']}"
+        )
 
         return {
             "sentinel_token": sentinel_token,
@@ -1091,7 +1169,9 @@ class SoraClient:
                            multipart: Optional[Dict] = None,
                            add_sentinel_token: bool = False,
                            token_id: Optional[int] = None,
-                           use_image_upload_proxy: bool = False) -> Dict[str, Any]:
+                           use_image_upload_proxy: bool = False,
+                           auth_context: Optional[AuthContext] = None,
+                           referer: Optional[str] = None) -> Dict[str, Any]:
         """Make HTTP request with proxy support
 
         Args:
@@ -1109,21 +1189,28 @@ class SoraClient:
         else:
             proxy_url = await self.proxy_manager.get_proxy_url(token_id)
 
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent" : "Sora/1.2026.007 (Android 15; 24122RKC7C; build 2600700)"
-        }
+        if auth_context:
+            headers = self._headers_from_auth_context(
+                auth_context,
+                add_sentinel_token=add_sentinel_token,
+                referer=referer,
+            )
+        else:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "User-Agent" : "Sora/1.2026.007 (Android 15; 24122RKC7C; build 2600700)"
+            }
 
-        # 只在生成请求时添加 sentinel token
-        if add_sentinel_token:
-            sentinel_context = await self._generate_sentinel_token(token, token_id=token_id)
-            headers["openai-sentinel-token"] = sentinel_context["sentinel_token"]
-            if sentinel_context.get("user_agent"):
-                headers["User-Agent"] = sentinel_context["user_agent"]
-            if sentinel_context.get("device_id"):
-                headers["oai-device-id"] = sentinel_context["device_id"]
-            if sentinel_context.get("cookie_header"):
-                headers["Cookie"] = sentinel_context["cookie_header"]
+            # 只在生成请求时添加 sentinel token
+            if add_sentinel_token:
+                sentinel_context = await self._generate_sentinel_token(token, token_id=token_id)
+                headers["openai-sentinel-token"] = sentinel_context["sentinel_token"]
+                if sentinel_context.get("user_agent"):
+                    headers["User-Agent"] = sentinel_context["user_agent"]
+                if sentinel_context.get("device_id"):
+                    headers["oai-device-id"] = sentinel_context["device_id"]
+                if sentinel_context.get("cookie_header"):
+                    headers["Cookie"] = sentinel_context["cookie_header"]
 
         if not multipart:
             headers["Content-Type"] = "application/json"
@@ -1219,7 +1306,13 @@ class SoraClient:
                     response_text=response.text,
                     source="Server"
                 )
-                raise Exception(error_msg)
+                high_risk = response.status_code in {401, 403}
+                raise UpstreamExecutionError(
+                    error_msg,
+                    status_code=response.status_code,
+                    response_body=response.text,
+                    high_risk=high_risk,
+                )
 
             return response_json if response_json else response.json()
     
@@ -1274,7 +1367,8 @@ class SoraClient:
         return result["id"]
     
     async def generate_image(self, prompt: str, token: str, width: int = 360,
-                            height: int = 360, media_id: Optional[str] = None, token_id: Optional[int] = None) -> str:
+                            height: int = 360, media_id: Optional[str] = None, token_id: Optional[int] = None,
+                            auth_context: Optional[AuthContext] = None) -> str:
         """Generate image (text-to-image or image-to-image)"""
         operation = "remix" if media_id else "simple_compose"
 
@@ -1298,12 +1392,22 @@ class SoraClient:
         }
 
         # 生成请求需要添加 sentinel token
-        result = await self._make_request("POST", "/video_gen", token, json_data=json_data, add_sentinel_token=True, token_id=token_id)
+        result = await self._make_request(
+            "POST",
+            "/video_gen",
+            token,
+            json_data=json_data,
+            add_sentinel_token=True,
+            token_id=token_id,
+            auth_context=auth_context,
+            referer="https://sora.chatgpt.com/explore",
+        )
         return result["id"]
     
     async def generate_video(self, prompt: str, token: str, orientation: str = "landscape",
                             media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None,
-                            model: str = "sy_8", size: str = "small", token_id: Optional[int] = None) -> str:
+                            model: str = "sy_8", size: str = "small", token_id: Optional[int] = None,
+                            auth_context: Optional[AuthContext] = None) -> str:
         """Generate video (text-to-video or image-to-video)
 
         Args:
@@ -1324,18 +1428,30 @@ class SoraClient:
                 "upload_id": media_id
             }]
 
-        json_data = {
-            "kind": "video",
-            "prompt": prompt,
-            "orientation": orientation,
-            "size": size,
-            "n_frames": n_frames,
-            "model": model,
-            "inpaint_items": inpaint_items,
-            "style_id": style_id
-        }
+        json_data = self._build_video_payload(
+            prompt,
+            orientation=orientation,
+            size=size,
+            n_frames=n_frames,
+            model=model,
+            inpaint_items=inpaint_items,
+            style_id=style_id,
+        )
 
         proxy_url = await self.proxy_manager.get_proxy_url(token_id)
+
+        if auth_context:
+            result = await self._nf_create_urllib(
+                auth_context.access_token,
+                json_data,
+                auth_context.sentinel_token or "",
+                proxy_url,
+                token_id,
+                auth_context.user_agent,
+                auth_context.device_id,
+                auth_context.cookie_header,
+            )
+            return result["id"]
 
         # Get POW proxy from configuration (unified with pow_service config)
         pow_proxy_url = None
@@ -1474,11 +1590,18 @@ class SoraClient:
                     "kind": "sora"
                 }
             ],
-            "post_text": ""
+            "post_text": prompt or ""
         }
 
         # 发布请求需要添加 sentinel token
-        result = await self._make_request("POST", "/project_y/post", token, json_data=json_data, add_sentinel_token=True)
+        result = await self._make_request(
+            "POST",
+            "/project_y/post",
+            token,
+            json_data=json_data,
+            add_sentinel_token=True,
+            referer=f"https://sora.chatgpt.com/d/{generation_id}",
+        )
 
         # 返回 post.id
         return result.get("post", {}).get("id", "")
@@ -1854,7 +1977,8 @@ class SoraClient:
             return True
 
     async def remix_video(self, remix_target_id: str, prompt: str, token: str,
-                         orientation: str = "portrait", n_frames: int = 450, style_id: Optional[str] = None) -> str:
+                         orientation: str = "portrait", n_frames: int = 450, style_id: Optional[str] = None,
+                         token_id: Optional[int] = None, auth_context: Optional[AuthContext] = None) -> str:
         """Generate video using remix (based on existing video)
 
         Args:
@@ -1868,27 +1992,39 @@ class SoraClient:
         Returns:
             task_id
         """
-        json_data = {
-            "kind": "video",
-            "prompt": prompt,
-            "inpaint_items": [],
-            "remix_target_id": remix_target_id,
-            "cameo_ids": [],
-            "cameo_replacements": {},
-            "model": "sy_8",
-            "orientation": orientation,
-            "n_frames": n_frames,
-            "style_id": style_id
-        }
+        json_data = self._build_video_payload(
+            prompt,
+            orientation=orientation,
+            size="small",
+            n_frames=n_frames,
+            model="sy_8",
+            inpaint_items=[],
+            style_id=style_id,
+            remix_target_id=remix_target_id,
+        )
 
         # Generate sentinel token and call /nf/create using urllib
-        proxy_url = await self.proxy_manager.get_proxy_url()
-        sentinel_context = await self._generate_sentinel_token(token)
+        proxy_url = await self.proxy_manager.get_proxy_url(token_id)
+        if auth_context:
+            result = await self._nf_create_urllib(
+                auth_context.access_token,
+                json_data,
+                auth_context.sentinel_token or "",
+                proxy_url,
+                token_id,
+                auth_context.user_agent,
+                auth_context.device_id,
+                auth_context.cookie_header,
+            )
+            return result.get("id")
+
+        sentinel_context = await self._generate_sentinel_token(token, token_id=token_id)
         result = await self._nf_create_urllib(
             token,
             json_data,
             sentinel_context["sentinel_token"],
             proxy_url,
+            token_id,
             user_agent=sentinel_context.get("user_agent"),
             device_id=sentinel_context.get("device_id"),
             cookie_header=sentinel_context.get("cookie_header"),
@@ -1896,7 +2032,8 @@ class SoraClient:
         return result.get("id")
 
     async def extend_video(self, generation_id: str, prompt: str, extension_duration_s: int,
-                          token: str, token_id: Optional[int] = None) -> str:
+                          token: str, token_id: Optional[int] = None,
+                          auth_context: Optional[AuthContext] = None) -> str:
         """Extend an existing video draft by generation id.
 
         Args:
@@ -1924,12 +2061,15 @@ class SoraClient:
             token,
             json_data=json_data,
             add_sentinel_token=True,
-            token_id=token_id
+            token_id=token_id,
+            auth_context=auth_context,
+            referer=f"https://sora.chatgpt.com/d/{generation_id}",
         )
         return result.get("id")
 
     async def generate_storyboard(self, prompt: str, token: str, orientation: str = "landscape",
-                                 media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None) -> str:
+                                 media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None,
+                                 token_id: Optional[int] = None, auth_context: Optional[AuthContext] = None) -> str:
         """Generate video using storyboard mode
 
         Args:
@@ -1970,7 +2110,16 @@ class SoraClient:
             "video_caption": None
         }
 
-        result = await self._make_request("POST", "/nf/create/storyboard", token, json_data=json_data, add_sentinel_token=True)
+        result = await self._make_request(
+            "POST",
+            "/nf/create/storyboard",
+            token,
+            json_data=json_data,
+            add_sentinel_token=True,
+            token_id=token_id,
+            auth_context=auth_context,
+            referer="https://sora.chatgpt.com/explore",
+        )
         return result.get("id")
 
     async def enhance_prompt(self, prompt: str, token: str, expansion_level: str = "medium",

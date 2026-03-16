@@ -46,3 +46,11 @@ custom_parse_token = ""
 
 [token_refresh]
 at_auto_refresh_enabled = false
+
+[browser]
+provider = "nstbrowser"
+executable_path = ""
+headless = false
+startup_timeout = 90
+action_timeout = 45
+profiles_root = ""

@@ -78,3 +78,11 @@ api_key = "your-secure-api-key-here"
 proxy_enabled = false
 proxy_url = ""
 
+[browser]
+provider = "nstbrowser"
+executable_path = ""
+headless = false
+startup_timeout = 90
+action_timeout = 45
+profiles_root = ""
+

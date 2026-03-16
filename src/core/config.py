@@ -346,5 +346,35 @@ class Config:
             self._config["pow_service"] = {}
         self._config["pow_service"]["proxy_url"] = url
 
+    @property
+    def browser_provider(self) -> str:
+        """Get browser provider name."""
+        return self._config.get("browser", {}).get("provider", "nstbrowser")
+
+    @property
+    def browser_executable_path(self) -> str:
+        """Get browser executable path."""
+        return self._config.get("browser", {}).get("executable_path", "")
+
+    @property
+    def browser_headless(self) -> bool:
+        """Whether the browser should run headless."""
+        return self._config.get("browser", {}).get("headless", False)
+
+    @property
+    def browser_startup_timeout(self) -> int:
+        """Get browser startup timeout in seconds."""
+        return int(self._config.get("browser", {}).get("startup_timeout", 90))
+
+    @property
+    def browser_action_timeout(self) -> int:
+        """Get browser action timeout in seconds."""
+        return int(self._config.get("browser", {}).get("action_timeout", 45))
+
+    @property
+    def browser_profiles_root(self) -> str:
+        """Get root directory for browser profiles."""
+        return self._config.get("browser", {}).get("profiles_root", "")
+
 # Global config instance
 config = Config()

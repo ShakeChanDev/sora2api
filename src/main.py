@@ -18,6 +18,8 @@ from .services.load_balancer import LoadBalancer
 from .services.sora_client import SoraClient
 from .services.generation_handler import GenerationHandler
 from .services.concurrency_manager import ConcurrencyManager
+from .services.browser_provider import NstBrowserProvider
+from .services.mutation_executor import MutationExecutor
 from .api import routes as api_routes
 from .api import admin as admin_routes
 
@@ -47,7 +49,17 @@ proxy_manager = ProxyManager(db)
 concurrency_manager = ConcurrencyManager()
 load_balancer = LoadBalancer(token_manager, concurrency_manager)
 sora_client = SoraClient(proxy_manager)
-generation_handler = GenerationHandler(sora_client, token_manager, load_balancer, db, proxy_manager, concurrency_manager)
+browser_provider = NstBrowserProvider()
+mutation_executor = MutationExecutor(browser_provider, db)
+generation_handler = GenerationHandler(
+    sora_client,
+    token_manager,
+    load_balancer,
+    db,
+    proxy_manager,
+    concurrency_manager,
+    mutation_executor,
+)
 
 # Set dependencies for route modules
 api_routes.set_generation_handler(generation_handler)

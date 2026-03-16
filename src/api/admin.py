@@ -4,11 +4,13 @@ from fastapi.responses import FileResponse
 from typing import List, Optional
 from datetime import datetime
 from pathlib import Path
+import json
 import secrets
 from pydantic import BaseModel
 from apscheduler.triggers.cron import CronTrigger
 from ..core.auth import AuthManager
 from ..core.config import config
+from ..core.sensitive import mask_secret, sanitize_json_text
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
@@ -27,6 +29,62 @@ scheduler = None
 
 # Store active admin tokens (in production, use Redis or database)
 active_admin_tokens = set()
+
+
+def _parse_datetime_value(value):
+    """Parse database timestamps that may be stored in multiple string formats."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        normalized = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    return datetime.strptime(value, fmt)
+                except ValueError:
+                    continue
+    return None
+
+
+def _hydrate_terminal_log_state(log_data: dict, task, raw_created_at):
+    """Derive terminal log state from task rows when older logs were never finalized."""
+    if not task:
+        return
+
+    log_data["progress"] = task.progress
+    log_data["task_status"] = task.status
+
+    if log_data.get("status_code") != -1 or task.status not in {"completed", "failed"}:
+        return
+
+    is_completed = task.status == "completed"
+    log_data["status_code"] = 200 if is_completed else 500
+
+    if log_data.get("duration") == -1:
+        # Historical rows may mix UTC/local naive timestamps, so avoid fabricating a wrong duration.
+        log_data["duration"] = 0.0
+
+    if log_data.get("response_body") not in (None, "", "{}"):
+        return
+
+    if is_completed:
+        response_payload = {
+            "task_id": task.task_id,
+            "status": "success",
+        }
+        if task.result_urls:
+            try:
+                response_payload["result_urls"] = json.loads(task.result_urls)
+            except (TypeError, json.JSONDecodeError):
+                response_payload["result_urls"] = task.result_urls
+        log_data["response_body"] = sanitize_json_text(json.dumps(response_payload, ensure_ascii=False))
+    else:
+        response_payload = {"error": task.error_message or "Task failed"}
+        log_data["response_body"] = sanitize_json_text(json.dumps(response_payload, ensure_ascii=False))
 
 def set_dependencies(tm: TokenManager, pm: ProxyManager, database: Database, gh=None, cm: ConcurrencyManager = None, sched=None):
     """Set dependencies"""
@@ -64,12 +122,14 @@ class LoginResponse(BaseModel):
     message: Optional[str] = None
 
 class AddTokenRequest(BaseModel):
-    token: str  # Access Token (AT)
+    token: Optional[str] = None  # Access Token (AT)
     st: Optional[str] = None  # Session Token (optional, for storage)
     rt: Optional[str] = None  # Refresh Token (optional, for storage)
     client_id: Optional[str] = None  # Client ID (optional)
     proxy_url: Optional[str] = None  # Proxy URL (optional)
     remark: Optional[str] = None
+    browser_profile_id: Optional[str] = None
+    browser_profile_path: Optional[str] = None
     image_enabled: bool = True  # Enable image generation
     video_enabled: bool = True  # Enable video generation
     image_concurrency: int = 1  # Image concurrency limit (default: 1)
@@ -92,6 +152,8 @@ class UpdateTokenRequest(BaseModel):
     client_id: Optional[str] = None  # Client ID
     proxy_url: Optional[str] = None  # Proxy URL
     remark: Optional[str] = None
+    browser_profile_id: Optional[str] = None
+    browser_profile_path: Optional[str] = None
     image_enabled: Optional[bool] = None  # Enable image generation
     video_enabled: Optional[bool] = None  # Enable video generation
     image_concurrency: Optional[int] = None  # Image concurrency limit
@@ -105,6 +167,8 @@ class ImportTokenItem(BaseModel):
     client_id: Optional[str] = None  # Client ID (optional, for compatibility)
     proxy_url: Optional[str] = None  # Proxy URL (optional, for compatibility)
     remark: Optional[str] = None  # Remark (optional, for compatibility)
+    browser_profile_id: Optional[str] = None
+    browser_profile_path: Optional[str] = None
     is_active: bool = True  # Active status
     image_enabled: bool = True  # Enable image generation
     video_enabled: bool = True  # Enable video generation
@@ -182,6 +246,43 @@ class UpdatePowServiceConfigRequest(BaseModel):
     proxy_enabled: Optional[bool] = None
     proxy_url: Optional[str] = None
 
+
+async def _resolve_access_token_for_write(
+    *,
+    access_token: Optional[str],
+    session_token: Optional[str],
+    refresh_token: Optional[str],
+    client_id: Optional[str],
+) -> tuple[Optional[str], Optional[str], dict]:
+    """Resolve a usable access token without exposing raw secrets to the client."""
+    if access_token:
+        return access_token, refresh_token, {
+            "source": "access_token",
+            "access_token_preview": mask_secret(access_token),
+        }
+
+    if session_token:
+        result = await token_manager.st_to_at(session_token)
+        return result["access_token"], refresh_token, {
+            "source": "session_token",
+            "access_token_preview": mask_secret(result["access_token"]),
+            "email": result.get("email"),
+            "expires": result.get("expires"),
+        }
+
+    if refresh_token:
+        result = await token_manager.rt_to_at(refresh_token, client_id=client_id)
+        rotated_refresh_token = result.get("refresh_token") or refresh_token
+        return result["access_token"], rotated_refresh_token, {
+            "source": "refresh_token",
+            "access_token_preview": mask_secret(result["access_token"]),
+            "refresh_token_preview": mask_secret(rotated_refresh_token),
+            "refresh_token_rotated": bool(result.get("refresh_token")),
+            "expires_in": result.get("expires_in"),
+        }
+
+    return None, refresh_token, {"source": None}
+
 class BatchDisableRequest(BaseModel):
     token_ids: List[int]
 
@@ -220,14 +321,24 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
         stats = await db.get_token_stats(token.id)
         result.append({
             "id": token.id,
-            "token": token.token,  # 完整的Access Token
-            "st": token.st,  # 完整的Session Token
-            "rt": token.rt,  # 完整的Refresh Token
-            "client_id": token.client_id,  # Client ID
+            "token": mask_secret(token.token),
+            "st": mask_secret(token.st),
+            "rt": mask_secret(token.rt),
+            "client_id": mask_secret(token.client_id),
+            "token_preview": mask_secret(token.token),
+            "st_preview": mask_secret(token.st),
+            "rt_preview": mask_secret(token.rt),
+            "client_id_preview": mask_secret(token.client_id),
+            "has_token": bool(token.token),
+            "has_st": bool(token.st),
+            "has_rt": bool(token.rt),
+            "has_client_id": bool(token.client_id),
             "proxy_url": token.proxy_url,  # Proxy URL
             "email": token.email,
             "name": token.name,
             "remark": token.remark,
+            "browser_profile_id": token.browser_profile_id,
+            "browser_profile_path": token.browser_profile_path,
             "expiry_time": token.expiry_time.isoformat() if token.expiry_time else None,
             "is_active": token.is_active,
             "cooled_until": token.cooled_until.isoformat() if token.cooled_until else None,
@@ -248,6 +359,15 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
             "sora2_total_count": token.sora2_total_count,
             "sora2_remaining_count": token.sora2_remaining_count,
             "sora2_cooldown_until": token.sora2_cooldown_until.isoformat() if token.sora2_cooldown_until else None,
+            "subscription_status": token.subscription_status,
+            "sora_available": token.sora_available,
+            "account_state": token.account_state,
+            "account_state_reason": token.account_state_reason,
+            "source_of_truth": token.source_of_truth,
+            "last_auth_refresh_at": token.last_auth_refresh_at.isoformat() if token.last_auth_refresh_at else None,
+            "last_browser_check_at": token.last_browser_check_at.isoformat() if token.last_browser_check_at else None,
+            "last_quota_check_at": token.last_quota_check_at.isoformat() if token.last_quota_check_at else None,
+            "last_auth_error_code": token.last_auth_error_code,
             # 功能开关
             "image_enabled": token.image_enabled,
             "video_enabled": token.video_enabled,
@@ -263,15 +383,26 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
 
 @router.post("/api/tokens")
 async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_token)):
-    """Add a new Access Token"""
+    """Add a token using AT or server-side ST/RT conversion."""
     try:
+        resolved_access_token, resolved_refresh_token, _ = await _resolve_access_token_for_write(
+            access_token=request.token,
+            session_token=request.st,
+            refresh_token=request.rt,
+            client_id=request.client_id,
+        )
+        if not resolved_access_token:
+            raise ValueError("请提供 access_token，或提供 session_token / refresh_token 以便服务端安全转换")
+
         new_token = await token_manager.add_token(
-            token_value=request.token,
+            token_value=resolved_access_token,
             st=request.st,
-            rt=request.rt,
+            rt=resolved_refresh_token,
             client_id=request.client_id,
             proxy_url=request.proxy_url,
             remark=request.remark,
+            browser_profile_id=request.browser_profile_id,
+            browser_profile_path=request.browser_profile_path,
             update_if_exists=False,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
@@ -294,30 +425,31 @@ async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_
 
 @router.post("/api/tokens/st2at")
 async def st_to_at(request: ST2ATRequest, token: str = Depends(verify_admin_token)):
-    """Convert Session Token to Access Token (only convert, not add to database)"""
+    """Validate ST conversion without returning raw access token."""
     try:
         result = await token_manager.st_to_at(request.st)
         return {
             "success": True,
-            "message": "ST converted to AT successfully",
-            "access_token": result["access_token"],
+            "message": "ST 校验成功，提交表单时服务端会安全转换并入库",
+            "access_token_preview": mask_secret(result["access_token"]),
             "email": result.get("email"),
-            "expires": result.get("expires")
+            "expires": result.get("expires"),
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/api/tokens/rt2at")
 async def rt_to_at(request: RT2ATRequest, token: str = Depends(verify_admin_token)):
-    """Convert Refresh Token to Access Token (only convert, not add to database)"""
+    """Validate RT conversion without returning raw access or refresh tokens."""
     try:
         result = await token_manager.rt_to_at(request.rt, client_id=request.client_id)
         return {
             "success": True,
-            "message": "RT converted to AT successfully",
-            "access_token": result["access_token"],
-            "refresh_token": result.get("refresh_token"),
-            "expires_in": result.get("expires_in")
+            "message": "RT 校验成功，提交表单时服务端会安全转换并入库",
+            "access_token_preview": mask_secret(result["access_token"]),
+            "refresh_token_preview": mask_secret(result.get("refresh_token") or request.rt),
+            "refresh_token_rotated": bool(result.get("refresh_token")),
+            "expires_in": result.get("expires_in"),
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -615,6 +747,8 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                     client_id=import_item.client_id,
                     proxy_url=import_item.proxy_url,
                     remark=import_item.remark,
+                    browser_profile_id=import_item.browser_profile_id,
+                    browser_profile_path=import_item.browser_profile_path,
                     image_enabled=import_item.image_enabled,
                     video_enabled=import_item.video_enabled,
                     image_concurrency=import_item.image_concurrency,
@@ -645,6 +779,8 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                     client_id=import_item.client_id,
                     proxy_url=import_item.proxy_url,
                     remark=import_item.remark,
+                    browser_profile_id=import_item.browser_profile_id,
+                    browser_profile_path=import_item.browser_profile_path,
                     update_if_exists=False,
                     image_enabled=import_item.image_enabled,
                     video_enabled=import_item.video_enabled,
@@ -800,14 +936,22 @@ async def update_token(
 ):
     """Update token (AT, ST, RT, proxy_url, remark, image_enabled, video_enabled, concurrency limits)"""
     try:
+        resolved_access_token, resolved_refresh_token, _ = await _resolve_access_token_for_write(
+            access_token=request.token,
+            session_token=request.st,
+            refresh_token=request.rt,
+            client_id=request.client_id,
+        )
         await token_manager.update_token(
             token_id=token_id,
-            token=request.token,
+            token=resolved_access_token,
             st=request.st,
-            rt=request.rt,
+            rt=resolved_refresh_token,
             client_id=request.client_id,
             proxy_url=request.proxy_url,
             remark=request.remark,
+            browser_profile_id=request.browser_profile_id,
+            browser_profile_path=request.browser_profile_path,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
@@ -834,7 +978,8 @@ async def get_admin_config(token: str = Depends(verify_admin_token)) -> dict:
         "task_retry_enabled": admin_config.task_retry_enabled,
         "task_max_retries": admin_config.task_max_retries,
         "auto_disable_on_401": admin_config.auto_disable_on_401,
-        "api_key": config.api_key,
+        "api_key": mask_secret(config.api_key),
+        "api_key_preview": mask_secret(config.api_key),
         "admin_username": config.admin_username,
         "debug_enabled": config.debug_enabled
     }
@@ -920,7 +1065,11 @@ async def update_api_key(
         # Update in-memory config
         config.api_key = request.new_api_key
 
-        return {"success": True, "message": "API key updated successfully"}
+        return {
+            "success": True,
+            "message": "API key updated successfully",
+            "api_key_preview": mask_secret(request.new_api_key),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update API key: {str(e)}")
 
@@ -1107,9 +1256,8 @@ async def get_logs(limit: int = 100, token: str = Depends(verify_admin_token)):
     result = []
     for log in logs:
         # Convert UTC time to local timezone
-        created_at = log.get("created_at")
-        if created_at:
-            created_at = convert_utc_to_local(created_at)
+        raw_created_at = log.get("created_at")
+        created_at = convert_utc_to_local(raw_created_at) if raw_created_at else None
 
         log_data = {
             "id": log.get("id"),
@@ -1125,12 +1273,26 @@ async def get_logs(limit: int = 100, token: str = Depends(verify_admin_token)):
             "task_id": log.get("task_id")
         }
 
+        log_data["request_body"] = sanitize_json_text(log_data["request_body"])
+        log_data["response_body"] = sanitize_json_text(log_data["response_body"])
+        log_data["phase"] = log.get("phase")
+        log_data["mutation_type"] = log.get("mutation_type")
+        log_data["execution_strategy"] = log.get("execution_strategy")
+        log_data["profile_id"] = log.get("profile_id")
+        log_data["window_id"] = log.get("window_id")
+        log_data["auth_refreshed_at"] = log.get("auth_refreshed_at")
+        log_data["auth_source"] = log.get("auth_source")
+        log_data["error_code"] = log.get("error_code")
+        log_data["upstream_status"] = log.get("upstream_status")
+        log_data["attempt_index"] = log.get("attempt_index")
+        log_data["request_fingerprint"] = log.get("request_fingerprint")
+        log_data["response_fingerprint"] = log.get("response_fingerprint")
+
         # If task_id exists, get task progress and status
         if log.get("task_id"):
             task = await db.get_task(log.get("task_id"))
             if task:
-                log_data["progress"] = task.progress
-                log_data["task_status"] = task.status
+                _hydrate_terminal_log_state(log_data, task, raw_created_at)
 
         result.append(log_data)
 
@@ -1481,7 +1643,8 @@ async def get_pow_service_config(token: str = Depends(verify_admin_token)) -> di
             "mode": config_obj.mode,
             "use_token_for_pow": config_obj.use_token_for_pow,
             "server_url": config_obj.server_url or "",
-            "api_key": config_obj.api_key or "",
+            "api_key": mask_secret(config_obj.api_key),
+            "api_key_preview": mask_secret(config_obj.api_key),
             "proxy_enabled": config_obj.proxy_enabled,
             "proxy_url": config_obj.proxy_url or ""
         }
@@ -1494,11 +1657,13 @@ async def update_pow_service_config(
 ):
     """Update POW service configuration"""
     try:
+        current_config = await db.get_pow_service_config()
+        effective_api_key = request.api_key if request.api_key else current_config.api_key
         await db.update_pow_service_config(
             mode=request.mode,
             use_token_for_pow=request.use_token_for_pow or False,
             server_url=request.server_url,
-            api_key=request.api_key,
+            api_key=effective_api_key,
             proxy_enabled=request.proxy_enabled,
             proxy_url=request.proxy_url
         )
@@ -1506,13 +1671,14 @@ async def update_pow_service_config(
         config.set_pow_service_mode(request.mode)
         config.set_pow_service_use_token_for_pow(request.use_token_for_pow or False)
         config.set_pow_service_server_url(request.server_url or "")
-        config.set_pow_service_api_key(request.api_key or "")
+        config.set_pow_service_api_key(effective_api_key or "")
         config.set_pow_service_proxy_enabled(request.proxy_enabled or False)
         config.set_pow_service_proxy_url(request.proxy_url or "")
 
         return {
             "success": True,
-            "message": "POW service configuration updated"
+            "message": "POW service configuration updated",
+            "api_key_preview": mask_secret(effective_api_key),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update POW service configuration: {str(e)}")

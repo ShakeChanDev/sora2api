@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 from .config import config
+from .sensitive import sanitize_value
 
 class DebugLogger:
     """Debug logger for API requests and responses"""
@@ -15,9 +16,13 @@ class DebugLogger:
     
     def _setup_logger(self):
         """Setup file logger"""
-        # Clear log file on startup
+        # Clear log file on startup when possible. If another live process still
+        # holds the file on Windows, fall back to append mode instead of failing startup.
         if self.log_file.exists():
-            self.log_file.unlink()
+            try:
+                self.log_file.unlink()
+            except PermissionError:
+                pass
 
         # Create logger
         self.logger = logging.getLogger("debug_logger")
@@ -98,12 +103,7 @@ class DebugLogger:
 
             # Headers
             self.logger.info("\n📋 Headers:")
-            masked_headers = dict(headers)
-            if "Authorization" in masked_headers:
-                auth_value = masked_headers["Authorization"]
-                if auth_value.startswith("Bearer "):
-                    token = auth_value[7:]
-                    masked_headers["Authorization"] = f"Bearer {self._mask_token(token)}"
+            masked_headers = sanitize_value(dict(headers))
 
             for key, value in masked_headers.items():
                 self.logger.info(f"  {key}: {value}")
@@ -112,10 +112,10 @@ class DebugLogger:
             if body is not None:
                 self.logger.info("\n📦 Request Body:")
                 if isinstance(body, (dict, list)):
-                    body_str = json.dumps(body, indent=2, ensure_ascii=False)
+                    body_str = json.dumps(sanitize_value(body), indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
                 else:
-                    self.logger.info(str(body))
+                    self.logger.info(str(sanitize_value(body)))
 
             # Files
             if files:
@@ -179,22 +179,23 @@ class DebugLogger:
 
             # Headers
             self.logger.info("\n📋 Response Headers:")
-            for key, value in headers.items():
+            for key, value in sanitize_value(dict(headers)).items():
                 self.logger.info(f"  {key}: {value}")
 
             # Body
             self.logger.info("\n📦 Response Body:")
             if isinstance(body, (dict, list)):
-                body_str = json.dumps(body, indent=2, ensure_ascii=False)
+                body_str = json.dumps(sanitize_value(body), indent=2, ensure_ascii=False)
                 self.logger.info(body_str)
             elif isinstance(body, str):
                 # Try to parse as JSON
                 try:
                     parsed = json.loads(body)
-                    body_str = json.dumps(parsed, indent=2, ensure_ascii=False)
+                    body_str = json.dumps(sanitize_value(parsed), indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
                 except:
                     # Not JSON, log as text (limit length)
+                    body = str(sanitize_value(body))
                     if len(body) > 2000:
                         self.logger.info(f"{body[:2000]}... (truncated)")
                     else:
@@ -243,10 +244,11 @@ class DebugLogger:
                 # Try to parse as JSON
                 try:
                     parsed = json.loads(response_text)
-                    body_str = json.dumps(parsed, indent=2, ensure_ascii=False)
+                    body_str = json.dumps(sanitize_value(parsed), indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
                 except:
                     # Not JSON, log as text
+                    response_text = str(sanitize_value(response_text))
                     if len(response_text) > 2000:
                         self.logger.info(f"{response_text[:2000]}... (truncated)")
                     else:
