@@ -42,6 +42,21 @@ class Token(BaseModel):
     is_expired: bool = False  # Token是否已过期（401 token_invalidated）
     # 禁用原因: manual=手动禁用, error_limit=错误次数超限, token_invalid=Token失效, expired=过期失效
     disabled_reason: Optional[str] = None
+    # 浏览器绑定与账号态
+    browser_provider: Optional[str] = None
+    browser_profile_id: Optional[str] = None
+    sora_available: Optional[bool] = None
+    account_status: Optional[str] = None
+    last_auth_refresh_at: Optional[datetime] = None
+    last_auth_result: Optional[str] = None
+    last_auth_error_reason: Optional[str] = None
+    last_challenge_reason: Optional[str] = None
+    last_browser_user_agent: Optional[str] = None
+    last_device_id: Optional[str] = None
+    last_egress_binding: Optional[str] = None
+    last_auth_context_hash: Optional[str] = None
+    last_auth_context_expires_at: Optional[datetime] = None
+    last_auth_page_url: Optional[str] = None
 
 class TokenStats(BaseModel):
     """Token statistics"""
@@ -69,6 +84,11 @@ class Task(BaseModel):
     result_urls: Optional[str] = None  # JSON array
     error_message: Optional[str] = None
     retry_count: int = 0  # 当前重试次数
+    current_stage: Optional[str] = None
+    failure_stage: Optional[str] = None
+    error_code: Optional[str] = None
+    error_category: Optional[str] = None
+    last_event_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
@@ -80,10 +100,62 @@ class RequestLog(BaseModel):
     operation: str
     request_body: Optional[str] = None
     response_body: Optional[str] = None
+    stage: Optional[str] = None
+    trigger_source: Optional[str] = None
+    is_redacted: bool = True
     status_code: int  # -1 for in-progress
     duration: float  # -1.0 for in-progress
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+class MutationAttempt(BaseModel):
+    """High-risk mutation execution record"""
+    id: Optional[int] = None
+    token_id: Optional[int] = None
+    task_id: Optional[str] = None
+    mutation_type: str
+    strategy: str
+    stage: str
+    status: str = "started"
+    provider: Optional[str] = None
+    profile_id: Optional[str] = None
+    window_id: Optional[str] = None
+    page_url: Optional[str] = None
+    egress_binding: Optional[str] = None
+    details: Optional[str] = None
+    error_code: Optional[str] = None
+    error_reason: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class TaskEvent(BaseModel):
+    """Structured task event record"""
+    id: Optional[int] = None
+    task_id: Optional[str] = None
+    token_id: Optional[int] = None
+    event_type: str
+    stage: Optional[str] = None
+    status: str = "info"
+    message: Optional[str] = None
+    details: Optional[str] = None
+    error_code: Optional[str] = None
+    error_reason: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class ErrorAttribution(BaseModel):
+    """Structured error attribution record"""
+    id: Optional[int] = None
+    task_id: Optional[str] = None
+    token_id: Optional[int] = None
+    mutation_type: Optional[str] = None
+    stage: str
+    error_code: Optional[str] = None
+    error_reason: Optional[str] = None
+    details: Optional[str] = None
+    created_at: Optional[datetime] = None
 
 class AdminConfig(BaseModel):
     """Admin configuration"""

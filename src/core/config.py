@@ -1,4 +1,5 @@
 """Configuration management"""
+import os
 import tomli
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -345,6 +346,53 @@ class Config:
         if "pow_service" not in self._config:
             self._config["pow_service"] = {}
         self._config["pow_service"]["proxy_url"] = url
+
+    @property
+    def browser_enabled(self) -> bool:
+        """Whether browser-backed mutations are enabled."""
+        return self._config.get("browser", {}).get("enabled", False)
+
+    @property
+    def browser_provider(self) -> str:
+        """Configured browser provider."""
+        return self._config.get("browser", {}).get("provider", "nst")
+
+    @property
+    def browser_default_profile_id(self) -> str:
+        """Default browser profile id used when a token has no explicit binding."""
+        return self._config.get("browser", {}).get("default_profile_id", "")
+
+    def set_browser_default_profile_id(self, profile_id: str):
+        """Set default browser profile id."""
+        if "browser" not in self._config:
+            self._config["browser"] = {}
+        self._config["browser"]["default_profile_id"] = profile_id
+
+    @property
+    def browser_page_timeout_ms(self) -> int:
+        """Page navigation/evaluation timeout in milliseconds."""
+        return int(self._config.get("browser", {}).get("page_timeout_ms", 45000))
+
+    @property
+    def browser_readiness_timeout_ms(self) -> int:
+        """Browser readiness timeout in milliseconds."""
+        return int(self._config.get("browser", {}).get("readiness_timeout_ms", 20000))
+
+    @property
+    def browser_auth_max_age_seconds(self) -> int:
+        """Maximum age for a cached auth context snapshot."""
+        return int(self._config.get("browser", {}).get("auth_max_age_seconds", 120))
+
+    @property
+    def nst_browser_base_url(self) -> str:
+        """NSTBrowser local API base URL."""
+        return self._config.get("nst_browser", {}).get("base_url", "http://127.0.0.1:8848/api/v2")
+
+    @property
+    def nst_browser_api_key(self) -> str:
+        """NSTBrowser local API key."""
+        configured = self._config.get("nst_browser", {}).get("api_key", "")
+        return configured or os.getenv("NST_BROWSER_API_KEY", "")
 
 # Global config instance
 config = Config()

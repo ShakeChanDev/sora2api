@@ -17,6 +17,7 @@ from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlMime
 from .proxy_manager import ProxyManager
 from .pow_service_client import pow_service_client
+from .mutation_executor import MutationExecutor
 from ..core.config import config
 from ..core.logger import debug_logger
 
@@ -507,8 +508,10 @@ class SoraClient:
     CHATGPT_BASE_URL = "https://chatgpt.com"
     SENTINEL_FLOW = "sora_2_create_task__auto"
 
-    def __init__(self, proxy_manager: ProxyManager):
+    def __init__(self, proxy_manager: ProxyManager, db=None, mutation_executor: Optional[MutationExecutor] = None):
         self.proxy_manager = proxy_manager
+        self.db = db
+        self.mutation_executor = mutation_executor
         self.base_url = config.sora_base_url
         self.timeout = config.sora_timeout
 
@@ -1317,126 +1320,18 @@ class SoraClient:
             size: Video size (small for standard, large for HD)
             token_id: Token ID for getting token-specific proxy (optional)
         """
-        inpaint_items = []
-        if media_id:
-            inpaint_items = [{
-                "kind": "upload",
-                "upload_id": media_id
-            }]
-
-        json_data = {
-            "kind": "video",
-            "prompt": prompt,
-            "orientation": orientation,
-            "size": size,
-            "n_frames": n_frames,
-            "model": model,
-            "inpaint_items": inpaint_items,
-            "style_id": style_id
-        }
-
-        proxy_url = await self.proxy_manager.get_proxy_url(token_id)
-
-        # Get POW proxy from configuration (unified with pow_service config)
-        pow_proxy_url = None
-        if config.pow_service_proxy_enabled:
-            pow_proxy_url = config.pow_service_proxy_url or None
-
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-        # Try to get cached sentinel token first (using lightweight Playwright approach)
-        try:
-            sentinel_context = await _get_cached_sentinel_token(
-                pow_proxy_url,
-                force_refresh=False,
-                access_token=token,
-                token_id=token_id,
-            )
-        except Exception as e:
-            # 403/429 errors from oai-did fetch - don't retry, just fail
-            error_str = str(e)
-            if "403" in error_str or "429" in error_str:
-                debug_logger.log_error(
-                    error_message=f"Failed to get sentinel token: {error_str}",
-                    status_code=403 if "403" in error_str else 429,
-                    response_text=error_str,
-                    source="Server"
-                )
-                raise
-            sentinel_context = None
-
-        if not sentinel_context:
-            # Fallback to manual POW if lightweight approach fails
-            debug_logger.log_info("[Warning] Lightweight sentinel token failed, falling back to manual POW")
-            sentinel_context = await self._generate_sentinel_token(
-                token,
-                user_agent=user_agent,
-                pow_proxy_url=pow_proxy_url,
-                token_id=token_id,
-            )
-
-        # First attempt with cached/generated token
-        try:
-            result = await self._nf_create_urllib(
-                token,
-                json_data,
-                sentinel_context["sentinel_token"],
-                proxy_url,
-                token_id,
-                sentinel_context.get("user_agent") or user_agent,
-                sentinel_context.get("device_id"),
-                sentinel_context.get("cookie_header"),
-            )
-            return result["id"]
-        except Exception as e:
-            error_str = str(e)
-            
-            # Check if it's a 400 error (sentinel token invalid)
-            if "400" in error_str or "sentinel" in error_str.lower() or "invalid" in error_str.lower():
-                debug_logger.log_info("[Sentinel] Got 400 error, refreshing token and retrying...")
-                
-                # Invalidate cache and get fresh token
-                _invalidate_sentinel_cache(token)
-                
-                try:
-                    sentinel_context = await _get_cached_sentinel_token(
-                        pow_proxy_url,
-                        force_refresh=True,
-                        access_token=token,
-                        token_id=token_id,
-                    )
-                except Exception as refresh_e:
-                    # 403/429 errors - don't continue
-                    error_str = str(refresh_e)
-                    if "403" in error_str or "429" in error_str:
-                        raise refresh_e
-                    sentinel_context = None
-                
-                if not sentinel_context:
-                    # Fallback to manual POW
-                    debug_logger.log_info("[Warning] Refresh failed, falling back to manual POW")
-                    sentinel_context = await self._generate_sentinel_token(
-                        token,
-                        user_agent=user_agent,
-                        pow_proxy_url=pow_proxy_url,
-                        token_id=token_id,
-                    )
-                
-                # Retry with fresh token
-                result = await self._nf_create_urllib(
-                    token,
-                    json_data,
-                    sentinel_context["sentinel_token"],
-                    proxy_url,
-                    token_id,
-                    sentinel_context.get("user_agent") or user_agent,
-                    sentinel_context.get("device_id"),
-                    sentinel_context.get("cookie_header"),
-                )
-                return result["id"]
-            
-            # For other errors, just re-raise
-            raise
+        if not self.mutation_executor:
+            raise RuntimeError("High-risk video submit requires a configured mutation executor")
+        return await self.mutation_executor.execute_video_submit(
+            prompt=prompt,
+            token_id=token_id,
+            orientation=orientation,
+            n_frames=n_frames,
+            model=model,
+            size=size,
+            media_id=media_id,
+            style_id=style_id,
+        )
     
     async def get_image_tasks(self, token: str, limit: int = 20, token_id: Optional[int] = None) -> Dict[str, Any]:
         """Get recent image generation tasks"""
@@ -1456,7 +1351,7 @@ class SoraClient:
         # The API returns a list directly
         return result if isinstance(result, list) else []
 
-    async def post_video_for_watermark_free(self, generation_id: str, prompt: str, token: str) -> str:
+    async def post_video_for_watermark_free(self, generation_id: str, prompt: str, token: str, token_id: Optional[int] = None) -> str:
         """Post video to get watermark-free version
 
         Args:
@@ -1467,21 +1362,13 @@ class SoraClient:
         Returns:
             Post ID (e.g., s_690ce161c2488191a3476e9969911522)
         """
-        json_data = {
-            "attachments_to_create": [
-                {
-                    "generation_id": generation_id,
-                    "kind": "sora"
-                }
-            ],
-            "post_text": ""
-        }
-
-        # 发布请求需要添加 sentinel token
-        result = await self._make_request("POST", "/project_y/post", token, json_data=json_data, add_sentinel_token=True)
-
-        # 返回 post.id
-        return result.get("post", {}).get("id", "")
+        if not self.mutation_executor:
+            raise RuntimeError("High-risk publish requires a configured mutation executor")
+        return await self.mutation_executor.execute_publish(
+            generation_id=generation_id,
+            post_text="",
+            token_id=token_id,
+        )
 
     async def delete_post(self, post_id: str, token: str) -> bool:
         """Delete a published post
@@ -1854,7 +1741,8 @@ class SoraClient:
             return True
 
     async def remix_video(self, remix_target_id: str, prompt: str, token: str,
-                         orientation: str = "portrait", n_frames: int = 450, style_id: Optional[str] = None) -> str:
+                         orientation: str = "portrait", n_frames: int = 450, style_id: Optional[str] = None,
+                         token_id: Optional[int] = None) -> str:
         """Generate video using remix (based on existing video)
 
         Args:
@@ -1868,32 +1756,16 @@ class SoraClient:
         Returns:
             task_id
         """
-        json_data = {
-            "kind": "video",
-            "prompt": prompt,
-            "inpaint_items": [],
-            "remix_target_id": remix_target_id,
-            "cameo_ids": [],
-            "cameo_replacements": {},
-            "model": "sy_8",
-            "orientation": orientation,
-            "n_frames": n_frames,
-            "style_id": style_id
-        }
-
-        # Generate sentinel token and call /nf/create using urllib
-        proxy_url = await self.proxy_manager.get_proxy_url()
-        sentinel_context = await self._generate_sentinel_token(token)
-        result = await self._nf_create_urllib(
-            token,
-            json_data,
-            sentinel_context["sentinel_token"],
-            proxy_url,
-            user_agent=sentinel_context.get("user_agent"),
-            device_id=sentinel_context.get("device_id"),
-            cookie_header=sentinel_context.get("cookie_header"),
+        if not self.mutation_executor:
+            raise RuntimeError("High-risk remix submit requires a configured mutation executor")
+        return await self.mutation_executor.execute_remix_submit(
+            remix_target_id=remix_target_id,
+            prompt=prompt,
+            token_id=token_id,
+            orientation=orientation,
+            n_frames=n_frames,
+            style_id=style_id,
         )
-        return result.get("id")
 
     async def extend_video(self, generation_id: str, prompt: str, extension_duration_s: int,
                           token: str, token_id: Optional[int] = None) -> str:
@@ -1918,18 +1790,18 @@ class SoraClient:
             "enable_rewrite": True
         }
 
-        result = await self._make_request(
-            "POST",
-            f"/project_y/profile/drafts/{generation_id}/long_video_extension",
-            token,
-            json_data=json_data,
-            add_sentinel_token=True,
-            token_id=token_id
+        if not self.mutation_executor:
+            raise RuntimeError("High-risk long video extension requires a configured mutation executor")
+        return await self.mutation_executor.execute_long_video_extension(
+            generation_id=generation_id,
+            prompt=prompt,
+            extension_duration_s=extension_duration_s,
+            token_id=token_id,
         )
-        return result.get("id")
 
     async def generate_storyboard(self, prompt: str, token: str, orientation: str = "landscape",
-                                 media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None) -> str:
+                                 media_id: Optional[str] = None, n_frames: int = 450,
+                                 style_id: Optional[str] = None, token_id: Optional[int] = None) -> str:
         """Generate video using storyboard mode
 
         Args:
@@ -1943,35 +1815,16 @@ class SoraClient:
         Returns:
             task_id
         """
-        inpaint_items = []
-        if media_id:
-            inpaint_items = [{
-                "kind": "upload",
-                "upload_id": media_id
-            }]
-
-        json_data = {
-            "kind": "video",
-            "prompt": prompt,
-            "title": "Draft your video",
-            "orientation": orientation,
-            "size": "small",
-            "n_frames": n_frames,
-            "storyboard_id": None,
-            "inpaint_items": inpaint_items,
-            "remix_target_id": None,
-            "model": "sy_8",
-            "metadata": None,
-            "style_id": style_id,
-            "cameo_ids": None,
-            "cameo_replacements": None,
-            "audio_caption": None,
-            "audio_transcript": None,
-            "video_caption": None
-        }
-
-        result = await self._make_request("POST", "/nf/create/storyboard", token, json_data=json_data, add_sentinel_token=True)
-        return result.get("id")
+        if not self.mutation_executor:
+            raise RuntimeError("High-risk storyboard submit requires a configured mutation executor")
+        return await self.mutation_executor.execute_storyboard_submit(
+            prompt=prompt,
+            token_id=token_id,
+            orientation=orientation,
+            media_id=media_id,
+            n_frames=n_frames,
+            style_id=style_id,
+        )
 
     async def enhance_prompt(self, prompt: str, token: str, expansion_level: str = "medium",
                             duration_s: int = 10, token_id: Optional[int] = None) -> str:

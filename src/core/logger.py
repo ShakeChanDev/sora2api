@@ -1,6 +1,7 @@
 """Debug logger module for detailed API request/response logging"""
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -52,6 +53,83 @@ class DebugLogger:
         if not config.debug_mask_token or len(token) <= 12:
             return token
         return f"{token[:6]}...{token[-6:]}"
+
+    def mask_secret(self, value: Optional[str], prefix: int = 6, suffix: int = 4) -> Optional[str]:
+        """Mask a secret while preserving recognizability."""
+        if value is None:
+            return None
+        value = str(value)
+        if not value:
+            return value
+        if len(value) <= prefix + suffix:
+            return "*" * len(value)
+        return f"{value[:prefix]}...{value[-suffix:]}"
+
+    def mask_proxy_url(self, value: Optional[str]) -> Optional[str]:
+        """Mask proxy credentials and address details."""
+        if not value:
+            return value
+        value = str(value)
+        scheme, rest = (value.split("://", 1) + [""])[:2]
+        tail = rest[-6:] if rest else ""
+        return f"{scheme}://***{tail}" if scheme else f"***{tail}"
+
+    def sanitize_value(self, value: Any, key: Optional[str] = None) -> Any:
+        """Recursively sanitize sensitive values for logs/admin surfaces."""
+        fully_redacted_keys = {
+            "authorization",
+            "cookie",
+            "set-cookie",
+            "token",
+            "access_token",
+            "accesstoken",
+            "st",
+            "session_token",
+            "rt",
+            "refresh_token",
+            "openai-sentinel-token",
+            "sentinel_token",
+            "oai-device-id",
+            "openai-device-id",
+        }
+        masked_keys = {
+            "client_id",
+            "proxy_url",
+        }
+        normalized_key = (key or "").lower()
+        if isinstance(value, dict):
+            return {k: self.sanitize_value(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self.sanitize_value(item, key) for item in value]
+        if value is None:
+            return None
+        if normalized_key == "proxy_url":
+            return self.mask_proxy_url(str(value))
+        if normalized_key in fully_redacted_keys:
+            return "[REDACTED]"
+        if normalized_key in masked_keys:
+            return self.mask_secret(str(value))
+        if isinstance(value, str):
+            redacted = value
+            redacted = re.sub(r"Bearer\s+[A-Za-z0-9\-\._~+/]+=*", "Bearer [REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(r"(__Secure-next-auth\.session-token=)([^;\\s]+)", r"\1[REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(r"(openai-sentinel-token[:=]\s*)([^,;\\s]+)", r"\1[REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(r"(oai-did=)([^;\\s]+)", r"\1[REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(r"\"accessToken\"\s*:\s*\"[^\"]+\"", "\"accessToken\":\"[REDACTED]\"", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(r"\"refresh_token\"\s*:\s*\"[^\"]+\"", "\"refresh_token\":\"[REDACTED]\"", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(r"\"session_token\"\s*:\s*\"[^\"]+\"", "\"session_token\":\"[REDACTED]\"", redacted, flags=re.IGNORECASE)
+            return redacted
+        return value
+
+    def sanitize_json_text(self, value: Optional[str]) -> Optional[str]:
+        """Sanitize a text blob that may contain JSON."""
+        if value is None:
+            return None
+        try:
+            return json.dumps(self.sanitize_value(json.loads(value)), ensure_ascii=False)
+        except Exception:
+            sanitized = self.sanitize_value(value)
+            return sanitized if isinstance(sanitized, str) else json.dumps(sanitized, ensure_ascii=False)
     
     def _format_timestamp(self) -> str:
         """Format current timestamp"""
@@ -98,7 +176,7 @@ class DebugLogger:
 
             # Headers
             self.logger.info("\n📋 Headers:")
-            masked_headers = dict(headers)
+            masked_headers = self.sanitize_value(dict(headers))
             if "Authorization" in masked_headers:
                 auth_value = masked_headers["Authorization"]
                 if auth_value.startswith("Bearer "):
@@ -111,11 +189,12 @@ class DebugLogger:
             # Body
             if body is not None:
                 self.logger.info("\n📦 Request Body:")
-                if isinstance(body, (dict, list)):
-                    body_str = json.dumps(body, indent=2, ensure_ascii=False)
+                sanitized_body = self.sanitize_value(body)
+                if isinstance(sanitized_body, (dict, list)):
+                    body_str = json.dumps(sanitized_body, indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
                 else:
-                    self.logger.info(str(body))
+                    self.logger.info(str(sanitized_body))
 
             # Files
             if files:
@@ -134,7 +213,7 @@ class DebugLogger:
 
             # Proxy
             if proxy:
-                self.logger.info(f"\n🌐 Proxy: {proxy}")
+                self.logger.info(f"\n🌐 Proxy: {self.mask_proxy_url(proxy)}")
 
             self._write_separator()
             self.logger.info("")  # Empty line
@@ -179,28 +258,29 @@ class DebugLogger:
 
             # Headers
             self.logger.info("\n📋 Response Headers:")
-            for key, value in headers.items():
+            for key, value in self.sanitize_value(headers).items():
                 self.logger.info(f"  {key}: {value}")
 
             # Body
             self.logger.info("\n📦 Response Body:")
-            if isinstance(body, (dict, list)):
-                body_str = json.dumps(body, indent=2, ensure_ascii=False)
+            sanitized_body = self.sanitize_value(body)
+            if isinstance(sanitized_body, (dict, list)):
+                body_str = json.dumps(sanitized_body, indent=2, ensure_ascii=False)
                 self.logger.info(body_str)
-            elif isinstance(body, str):
+            elif isinstance(sanitized_body, str):
                 # Try to parse as JSON
                 try:
-                    parsed = json.loads(body)
+                    parsed = json.loads(sanitized_body)
                     body_str = json.dumps(parsed, indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
                 except:
                     # Not JSON, log as text (limit length)
-                    if len(body) > 2000:
-                        self.logger.info(f"{body[:2000]}... (truncated)")
+                    if len(sanitized_body) > 2000:
+                        self.logger.info(f"{sanitized_body[:2000]}... (truncated)")
                     else:
-                        self.logger.info(body)
+                        self.logger.info(sanitized_body)
             else:
-                self.logger.info(str(body))
+                self.logger.info(str(sanitized_body))
 
             self._write_separator()
             self.logger.info("")  # Empty line
@@ -236,21 +316,23 @@ class DebugLogger:
             if status_code:
                 self.logger.info(f"Status Code: {status_code}")
 
-            self.logger.info(f"Error Message: {error_message}")
+            self.logger.info(f"Error Message: {self.sanitize_value(error_message)}")
 
             if response_text:
                 self.logger.info("\n📦 Error Response:")
                 # Try to parse as JSON
                 try:
                     parsed = json.loads(response_text)
+                    parsed = self.sanitize_value(parsed)
                     body_str = json.dumps(parsed, indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
                 except:
                     # Not JSON, log as text
-                    if len(response_text) > 2000:
-                        self.logger.info(f"{response_text[:2000]}... (truncated)")
+                    sanitized_text = self.sanitize_value(response_text)
+                    if len(sanitized_text) > 2000:
+                        self.logger.info(f"{sanitized_text[:2000]}... (truncated)")
                     else:
-                        self.logger.info(response_text)
+                        self.logger.info(sanitized_text)
 
             self._write_separator()
             self.logger.info("")  # Empty line
@@ -266,7 +348,7 @@ class DebugLogger:
             return
 
         try:
-            self.logger.info(f"ℹ️  [{self._format_timestamp()}] {message}")
+            self.logger.info(f"ℹ️  [{self._format_timestamp()}] {self.sanitize_value(message)}")
         except Exception as e:
             self.logger.error(f"Error logging info: {e}")
 
@@ -278,7 +360,7 @@ class DebugLogger:
             return
 
         try:
-            self.logger.warning(f"⚠️  [{self._format_timestamp()}] {message}")
+            self.logger.warning(f"⚠️  [{self._format_timestamp()}] {self.sanitize_value(message)}")
         except Exception as e:
             self.logger.error(f"Error logging warning: {e}")
 

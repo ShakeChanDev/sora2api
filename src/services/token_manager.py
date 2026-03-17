@@ -655,6 +655,8 @@ class TokenManager:
                        rt: Optional[str] = None,
                        client_id: Optional[str] = None,
                        proxy_url: Optional[str] = None,
+                       browser_provider: Optional[str] = None,
+                       browser_profile_id: Optional[str] = None,
                        remark: Optional[str] = None,
                        update_if_exists: bool = False,
                        image_enabled: bool = True,
@@ -819,6 +821,10 @@ class TokenManager:
             rt=rt,
             client_id=client_id,
             proxy_url=proxy_url,
+            browser_provider=browser_provider,
+            browser_profile_id=browser_profile_id,
+            sora_available=sora2_supported,
+            account_status="ready" if not skip_status_update else None,
             remark=remark,
             expiry_time=expiry_time,
             is_active=True,
@@ -905,6 +911,8 @@ class TokenManager:
                           rt: Optional[str] = None,
                           client_id: Optional[str] = None,
                           proxy_url: Optional[str] = None,
+                          browser_provider: Optional[str] = None,
+                          browser_profile_id: Optional[str] = None,
                           remark: Optional[str] = None,
                           image_enabled: Optional[bool] = None,
                           video_enabled: Optional[bool] = None,
@@ -921,9 +929,11 @@ class TokenManager:
             except Exception:
                 pass  # If JWT decode fails, keep expiry_time as None
 
-        await self.db.update_token(token_id, token=token, st=st, rt=rt, client_id=client_id, proxy_url=proxy_url, remark=remark, expiry_time=expiry_time,
-                                   image_enabled=image_enabled, video_enabled=video_enabled,
-                                   image_concurrency=image_concurrency, video_concurrency=video_concurrency)
+        await self.db.update_token(token_id, token=token, st=st, rt=rt, client_id=client_id, proxy_url=proxy_url,
+                                   browser_provider=browser_provider, browser_profile_id=browser_profile_id,
+                                   remark=remark, expiry_time=expiry_time, image_enabled=image_enabled,
+                                   video_enabled=video_enabled, image_concurrency=image_concurrency,
+                                   video_concurrency=video_concurrency)
 
         # If token (AT) is updated and not in offline mode, test it and clear expired flag if valid
         if token and not skip_status_update:
@@ -1010,7 +1020,9 @@ class TokenManager:
                 token_id,
                 plan_type=plan_type,
                 plan_title=plan_title,
-                subscription_end=subscription_end
+                subscription_end=subscription_end,
+                sora_available=sora2_supported,
+                account_status="ready"
             )
 
             # Update token Sora2 info in database
@@ -1058,6 +1070,11 @@ class TokenManager:
                     "valid": False,
                     "message": "Token无效: Token is invalid: Failed to get user info:401"
                 }
+            await self.db.update_token(
+                token_id,
+                account_status="auth_error",
+                last_auth_error_reason=error_msg
+            )
             return {
                 "valid": False,
                 "message": f"Token is invalid: {error_msg}"

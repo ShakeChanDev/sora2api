@@ -658,7 +658,8 @@ class GenerationHandler:
                         orientation=model_config["orientation"],
                         media_id=media_id,
                         n_frames=n_frames,
-                        style_id=style_id
+                        style_id=style_id,
+                        token_id=token_obj.id
                     )
                 else:
                     # Normal video generation
@@ -692,7 +693,8 @@ class GenerationHandler:
                 model=model,
                 prompt=prompt,
                 status="processing",
-                progress=0.0
+                progress=0.0,
+                current_stage="polling"
             )
             await self.db.create_task(task)
 
@@ -1115,7 +1117,8 @@ class GenerationHandler:
                                         post_id = await self.sora_client.post_video_for_watermark_free(
                                             generation_id=generation_id,
                                             prompt=prompt,
-                                            token=token
+                                            token=token,
+                                            token_id=token_id
                                         )
                                         debug_logger.log_info(f"Received post_id: {post_id}")
 
@@ -1574,8 +1577,11 @@ class GenerationHandler:
                 token_id=token_id,
                 task_id=task_id,
                 operation=operation,
-                request_body=json.dumps(request_data),
-                response_body=json.dumps(response_data),
+                request_body=json.dumps(debug_logger.sanitize_value(request_data), ensure_ascii=False),
+                response_body=json.dumps(debug_logger.sanitize_value(response_data), ensure_ascii=False),
+                stage=operation,
+                trigger_source="server",
+                is_redacted=True,
                 status_code=status_code,
                 duration=duration
             )
@@ -2187,7 +2193,8 @@ class GenerationHandler:
                 model=f"sora2-video-{model_config['orientation']}",
                 prompt=full_prompt,
                 status="processing",
-                progress=0.0
+                progress=0.0,
+                current_stage="polling"
             )
             await self.db.create_task(task)
 
@@ -2307,7 +2314,8 @@ class GenerationHandler:
                 token=token_obj.token,
                 orientation=model_config["orientation"],
                 n_frames=n_frames,
-                style_id=style_id
+                style_id=style_id,
+                token_id=token_obj.id
             )
             debug_logger.log_info(f"Remix generation started, task_id: {task_id}")
 
@@ -2318,7 +2326,8 @@ class GenerationHandler:
                 model=f"sora2-video-{model_config['orientation']}",
                 prompt=f"remix:{remix_target_id} {clean_prompt}",
                 status="processing",
-                progress=0.0
+                progress=0.0,
+                current_stage="polling"
             )
             await self.db.create_task(task)
 
@@ -2423,7 +2432,8 @@ class GenerationHandler:
                 model=model_name,
                 prompt=f"extend:{generation_id} {clean_prompt}",
                 status="processing",
-                progress=0.0
+                progress=0.0,
+                current_stage="polling"
             )
             await self.db.create_task(task)
             if log_id:

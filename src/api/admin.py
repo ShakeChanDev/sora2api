@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from apscheduler.triggers.cron import CronTrigger
 from ..core.auth import AuthManager
 from ..core.config import config
+from ..core.logger import debug_logger
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
@@ -27,6 +28,16 @@ scheduler = None
 
 # Store active admin tokens (in production, use Redis or database)
 active_admin_tokens = set()
+
+
+def _masked_secret(value: Optional[str]) -> Optional[str]:
+    """Mask a secret before returning it to admin clients."""
+    return debug_logger.mask_secret(value)
+
+
+def _masked_proxy(value: Optional[str]) -> Optional[str]:
+    """Mask proxy details before returning them to admin clients."""
+    return debug_logger.mask_proxy_url(value)
 
 def set_dependencies(tm: TokenManager, pm: ProxyManager, database: Database, gh=None, cm: ConcurrencyManager = None, sched=None):
     """Set dependencies"""
@@ -69,6 +80,8 @@ class AddTokenRequest(BaseModel):
     rt: Optional[str] = None  # Refresh Token (optional, for storage)
     client_id: Optional[str] = None  # Client ID (optional)
     proxy_url: Optional[str] = None  # Proxy URL (optional)
+    browser_provider: Optional[str] = None
+    browser_profile_id: Optional[str] = None
     remark: Optional[str] = None
     image_enabled: bool = True  # Enable image generation
     video_enabled: bool = True  # Enable video generation
@@ -91,6 +104,8 @@ class UpdateTokenRequest(BaseModel):
     rt: Optional[str] = None
     client_id: Optional[str] = None  # Client ID
     proxy_url: Optional[str] = None  # Proxy URL
+    browser_provider: Optional[str] = None
+    browser_profile_id: Optional[str] = None
     remark: Optional[str] = None
     image_enabled: Optional[bool] = None  # Enable image generation
     video_enabled: Optional[bool] = None  # Enable video generation
@@ -104,6 +119,8 @@ class ImportTokenItem(BaseModel):
     refresh_token: Optional[str] = None  # Refresh Token (RT)
     client_id: Optional[str] = None  # Client ID (optional, for compatibility)
     proxy_url: Optional[str] = None  # Proxy URL (optional, for compatibility)
+    browser_provider: Optional[str] = None
+    browser_profile_id: Optional[str] = None
     remark: Optional[str] = None  # Remark (optional, for compatibility)
     is_active: bool = True  # Active status
     image_enabled: bool = True  # Enable image generation
@@ -220,11 +237,19 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
         stats = await db.get_token_stats(token.id)
         result.append({
             "id": token.id,
-            "token": token.token,  # 完整的Access Token
-            "st": token.st,  # 完整的Session Token
-            "rt": token.rt,  # 完整的Refresh Token
-            "client_id": token.client_id,  # Client ID
-            "proxy_url": token.proxy_url,  # Proxy URL
+            "token": None,
+            "st": None,
+            "rt": None,
+            "token_masked": _masked_secret(token.token),
+            "st_masked": _masked_secret(token.st),
+            "rt_masked": _masked_secret(token.rt),
+            "has_token": bool(token.token),
+            "has_st": bool(token.st),
+            "has_rt": bool(token.rt),
+            "client_id": _masked_secret(token.client_id),
+            "client_id_masked": _masked_secret(token.client_id),
+            "proxy_url": None,
+            "proxy_url_masked": _masked_proxy(token.proxy_url),
             "email": token.email,
             "name": token.name,
             "remark": token.remark,
@@ -256,7 +281,22 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
             "video_concurrency": token.video_concurrency,
             # 过期和禁用信息
             "is_expired": token.is_expired,
-            "disabled_reason": token.disabled_reason
+            "disabled_reason": token.disabled_reason,
+            # 浏览器绑定与账号态
+            "browser_provider": token.browser_provider,
+            "browser_profile_id": token.browser_profile_id,
+            "sora_available": token.sora_available,
+            "account_status": token.account_status,
+            "last_auth_refresh_at": token.last_auth_refresh_at.isoformat() if token.last_auth_refresh_at else None,
+            "last_auth_result": token.last_auth_result,
+            "last_auth_error_reason": token.last_auth_error_reason,
+            "last_challenge_reason": token.last_challenge_reason,
+            "last_browser_user_agent": token.last_browser_user_agent,
+            "last_device_id": _masked_secret(token.last_device_id),
+            "last_egress_binding": token.last_egress_binding,
+            "last_auth_context_hash": token.last_auth_context_hash,
+            "last_auth_context_expires_at": token.last_auth_context_expires_at.isoformat() if token.last_auth_context_expires_at else None,
+            "last_auth_page_url": token.last_auth_page_url,
         })
 
     return result
@@ -271,6 +311,8 @@ async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_
             rt=request.rt,
             client_id=request.client_id,
             proxy_url=request.proxy_url,
+            browser_provider=request.browser_provider,
+            browser_profile_id=request.browser_profile_id,
             remark=request.remark,
             update_if_exists=False,
             image_enabled=request.image_enabled,
@@ -614,6 +656,8 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                     rt=import_item.refresh_token,
                     client_id=import_item.client_id,
                     proxy_url=import_item.proxy_url,
+                    browser_provider=import_item.browser_provider,
+                    browser_profile_id=import_item.browser_profile_id,
                     remark=import_item.remark,
                     image_enabled=import_item.image_enabled,
                     video_enabled=import_item.video_enabled,
@@ -644,6 +688,8 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                     rt=import_item.refresh_token,
                     client_id=import_item.client_id,
                     proxy_url=import_item.proxy_url,
+                    browser_provider=import_item.browser_provider,
+                    browser_profile_id=import_item.browser_profile_id,
                     remark=import_item.remark,
                     update_if_exists=False,
                     image_enabled=import_item.image_enabled,
@@ -807,6 +853,8 @@ async def update_token(
             rt=request.rt,
             client_id=request.client_id,
             proxy_url=request.proxy_url,
+            browser_provider=request.browser_provider,
+            browser_profile_id=request.browser_profile_id,
             remark=request.remark,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
@@ -1117,11 +1165,14 @@ async def get_logs(limit: int = 100, token: str = Depends(verify_admin_token)):
             "token_email": log.get("token_email"),
             "token_username": log.get("token_username"),
             "operation": log.get("operation"),
+            "stage": log.get("stage"),
+            "trigger_source": log.get("trigger_source"),
+            "is_redacted": log.get("is_redacted"),
             "status_code": log.get("status_code"),
             "duration": log.get("duration"),
             "created_at": created_at,
-            "request_body": log.get("request_body"),
-            "response_body": log.get("response_body"),
+            "request_body": debug_logger.sanitize_json_text(log.get("request_body")),
+            "response_body": debug_logger.sanitize_json_text(log.get("response_body")),
             "task_id": log.get("task_id")
         }
 
@@ -1131,6 +1182,9 @@ async def get_logs(limit: int = 100, token: str = Depends(verify_admin_token)):
             if task:
                 log_data["progress"] = task.progress
                 log_data["task_status"] = task.status
+                log_data["task_stage"] = task.current_stage
+                log_data["task_failure_stage"] = task.failure_stage
+                log_data["task_error_code"] = task.error_code
 
         result.append(log_data)
 

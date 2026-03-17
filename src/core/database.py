@@ -4,7 +4,21 @@ import json
 from datetime import datetime
 from typing import Optional, List
 from pathlib import Path
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, WatermarkFreeConfig, CacheConfig, GenerationConfig, TokenRefreshConfig
+from .models import (
+    Token,
+    TokenStats,
+    Task,
+    RequestLog,
+    AdminConfig,
+    ProxyConfig,
+    WatermarkFreeConfig,
+    CacheConfig,
+    GenerationConfig,
+    TokenRefreshConfig,
+    MutationAttempt,
+    TaskEvent,
+    ErrorAttribution,
+)
 
 class Database:
     """SQLite database manager"""
@@ -301,6 +315,20 @@ class Database:
                     ("client_id", "TEXT"),
                     ("proxy_url", "TEXT"),
                     ("is_expired", "BOOLEAN DEFAULT 0"),
+                    ("browser_provider", "TEXT"),
+                    ("browser_profile_id", "TEXT"),
+                    ("sora_available", "BOOLEAN"),
+                    ("account_status", "TEXT"),
+                    ("last_auth_refresh_at", "TIMESTAMP"),
+                    ("last_auth_result", "TEXT"),
+                    ("last_auth_error_reason", "TEXT"),
+                    ("last_challenge_reason", "TEXT"),
+                    ("last_browser_user_agent", "TEXT"),
+                    ("last_device_id", "TEXT"),
+                    ("last_egress_binding", "TEXT"),
+                    ("last_auth_context_hash", "TEXT"),
+                    ("last_auth_context_expires_at", "TIMESTAMP"),
+                    ("last_auth_page_url", "TEXT"),
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -460,6 +488,9 @@ class Database:
                 columns_to_add = [
                     ("task_id", "TEXT"),
                     ("updated_at", "TIMESTAMP"),
+                    ("stage", "TEXT"),
+                    ("trigger_source", "TEXT"),
+                    ("is_redacted", "BOOLEAN DEFAULT 1"),
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -469,6 +500,78 @@ class Database:
                             print(f"  ✓ Added column '{col_name}' to request_logs table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+            if await self._table_exists(db, "tasks"):
+                columns_to_add = [
+                    ("current_stage", "TEXT"),
+                    ("failure_stage", "TEXT"),
+                    ("error_code", "TEXT"),
+                    ("error_category", "TEXT"),
+                    ("last_event_at", "TIMESTAMP"),
+                ]
+
+                for col_name, col_type in columns_to_add:
+                    if not await self._column_exists(db, "tasks", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to tasks table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS mutation_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_id INTEGER,
+                    task_id TEXT,
+                    mutation_type TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'started',
+                    provider TEXT,
+                    profile_id TEXT,
+                    window_id TEXT,
+                    page_url TEXT,
+                    egress_binding TEXT,
+                    details TEXT,
+                    error_code TEXT,
+                    error_reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    token_id INTEGER,
+                    event_type TEXT NOT NULL,
+                    stage TEXT,
+                    status TEXT NOT NULL DEFAULT 'info',
+                    message TEXT,
+                    details TEXT,
+                    error_code TEXT,
+                    error_reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS error_attributions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    token_id INTEGER,
+                    mutation_type TEXT,
+                    stage TEXT NOT NULL,
+                    error_code TEXT,
+                    error_reason TEXT,
+                    details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
 
             # Ensure all config tables have their default rows
             # Pass config_dict if available to initialize from setting.toml
@@ -518,7 +621,21 @@ class Database:
                     image_concurrency INTEGER DEFAULT -1,
                     video_concurrency INTEGER DEFAULT -1,
                     is_expired BOOLEAN DEFAULT 0,
-                    disabled_reason TEXT
+                    disabled_reason TEXT,
+                    browser_provider TEXT,
+                    browser_profile_id TEXT,
+                    sora_available BOOLEAN,
+                    account_status TEXT,
+                    last_auth_refresh_at TIMESTAMP,
+                    last_auth_result TEXT,
+                    last_auth_error_reason TEXT,
+                    last_challenge_reason TEXT,
+                    last_browser_user_agent TEXT,
+                    last_device_id TEXT,
+                    last_egress_binding TEXT,
+                    last_auth_context_hash TEXT,
+                    last_auth_context_expires_at TIMESTAMP,
+                    last_auth_page_url TEXT
                 )
             """)
 
@@ -552,6 +669,11 @@ class Database:
                     progress FLOAT DEFAULT 0,
                     result_urls TEXT,
                     error_message TEXT,
+                    current_stage TEXT,
+                    failure_stage TEXT,
+                    error_code TEXT,
+                    error_category TEXT,
+                    last_event_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP,
                     FOREIGN KEY (token_id) REFERENCES tokens(id)
@@ -567,10 +689,68 @@ class Database:
                     operation TEXT NOT NULL,
                     request_body TEXT,
                     response_body TEXT,
+                    stage TEXT,
+                    trigger_source TEXT,
+                    is_redacted BOOLEAN DEFAULT 1,
                     status_code INTEGER NOT NULL,
                     duration FLOAT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS mutation_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_id INTEGER,
+                    task_id TEXT,
+                    mutation_type TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'started',
+                    provider TEXT,
+                    profile_id TEXT,
+                    window_id TEXT,
+                    page_url TEXT,
+                    egress_binding TEXT,
+                    details TEXT,
+                    error_code TEXT,
+                    error_reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    token_id INTEGER,
+                    event_type TEXT NOT NULL,
+                    stage TEXT,
+                    status TEXT NOT NULL DEFAULT 'info',
+                    message TEXT,
+                    details TEXT,
+                    error_code TEXT,
+                    error_reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS error_attributions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    token_id INTEGER,
+                    mutation_type TEXT,
+                    stage TEXT NOT NULL,
+                    error_code TEXT,
+                    error_reason TEXT,
+                    details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (token_id) REFERENCES tokens(id)
                 )
             """)
@@ -692,6 +872,10 @@ class Database:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_token_active ON tokens(is_active)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_mutation_attempts_token ON mutation_attempts(token_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_mutation_attempts_task ON mutation_attempts(task_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_error_attributions_task ON error_attributions(task_id)")
 
             # Migration: Add daily statistics columns if they don't exist
             if not await self._column_exists(db, "token_stats", "today_image_count"):
@@ -782,8 +966,13 @@ class Database:
                 INSERT INTO tokens (token, email, username, name, st, rt, client_id, proxy_url, remark, expiry_time, is_active,
                                    plan_type, plan_title, subscription_end, sora2_supported, sora2_invite_code,
                                    sora2_redeemed_count, sora2_total_count, sora2_remaining_count, sora2_cooldown_until,
-                                   image_enabled, video_enabled, image_concurrency, video_concurrency)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   image_enabled, video_enabled, image_concurrency, video_concurrency,
+                                   browser_provider, browser_profile_id, sora_available, account_status,
+                                   last_auth_refresh_at, last_auth_result, last_auth_error_reason,
+                                   last_challenge_reason, last_browser_user_agent, last_device_id,
+                                   last_egress_binding, last_auth_context_hash, last_auth_context_expires_at,
+                                   last_auth_page_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.token, token.email, "", token.name, token.st, token.rt, token.client_id, token.proxy_url,
                   token.remark, token.expiry_time, token.is_active,
                   token.plan_type, token.plan_title, token.subscription_end,
@@ -791,7 +980,12 @@ class Database:
                   token.sora2_redeemed_count, token.sora2_total_count,
                   token.sora2_remaining_count, token.sora2_cooldown_until,
                   token.image_enabled, token.video_enabled,
-                  token.image_concurrency, token.video_concurrency))
+                  token.image_concurrency, token.video_concurrency,
+                  token.browser_provider, token.browser_profile_id, token.sora_available, token.account_status,
+                  token.last_auth_refresh_at, token.last_auth_result, token.last_auth_error_reason,
+                  token.last_challenge_reason, token.last_browser_user_agent, token.last_device_id,
+                  token.last_egress_binding, token.last_auth_context_hash, token.last_auth_context_expires_at,
+                  token.last_auth_page_url))
             await db.commit()
             token_id = cursor.lastrowid
 
@@ -953,7 +1147,21 @@ class Database:
                           image_enabled: Optional[bool] = None,
                           video_enabled: Optional[bool] = None,
                           image_concurrency: Optional[int] = None,
-                          video_concurrency: Optional[int] = None):
+                          video_concurrency: Optional[int] = None,
+                          browser_provider: Optional[str] = None,
+                          browser_profile_id: Optional[str] = None,
+                          sora_available: Optional[bool] = None,
+                          account_status: Optional[str] = None,
+                          last_auth_refresh_at: Optional[datetime] = None,
+                          last_auth_result: Optional[str] = None,
+                          last_auth_error_reason: Optional[str] = None,
+                          last_challenge_reason: Optional[str] = None,
+                          last_browser_user_agent: Optional[str] = None,
+                          last_device_id: Optional[str] = None,
+                          last_egress_binding: Optional[str] = None,
+                          last_auth_context_hash: Optional[str] = None,
+                          last_auth_context_expires_at: Optional[datetime] = None,
+                          last_auth_page_url: Optional[str] = None):
         """Update token (AT, ST, RT, client_id, proxy_url, remark, expiry_time, subscription info, image_enabled, video_enabled)"""
         async with aiosqlite.connect(self.db_path) as db:
             # Build dynamic update query
@@ -1015,6 +1223,62 @@ class Database:
             if video_concurrency is not None:
                 updates.append("video_concurrency = ?")
                 params.append(video_concurrency)
+
+            if browser_provider is not None:
+                updates.append("browser_provider = ?")
+                params.append(browser_provider)
+
+            if browser_profile_id is not None:
+                updates.append("browser_profile_id = ?")
+                params.append(browser_profile_id)
+
+            if sora_available is not None:
+                updates.append("sora_available = ?")
+                params.append(sora_available)
+
+            if account_status is not None:
+                updates.append("account_status = ?")
+                params.append(account_status)
+
+            if last_auth_refresh_at is not None:
+                updates.append("last_auth_refresh_at = ?")
+                params.append(last_auth_refresh_at)
+
+            if last_auth_result is not None:
+                updates.append("last_auth_result = ?")
+                params.append(last_auth_result)
+
+            if last_auth_error_reason is not None:
+                updates.append("last_auth_error_reason = ?")
+                params.append(last_auth_error_reason)
+
+            if last_challenge_reason is not None:
+                updates.append("last_challenge_reason = ?")
+                params.append(last_challenge_reason)
+
+            if last_browser_user_agent is not None:
+                updates.append("last_browser_user_agent = ?")
+                params.append(last_browser_user_agent)
+
+            if last_device_id is not None:
+                updates.append("last_device_id = ?")
+                params.append(last_device_id)
+
+            if last_egress_binding is not None:
+                updates.append("last_egress_binding = ?")
+                params.append(last_egress_binding)
+
+            if last_auth_context_hash is not None:
+                updates.append("last_auth_context_hash = ?")
+                params.append(last_auth_context_hash)
+
+            if last_auth_context_expires_at is not None:
+                updates.append("last_auth_context_expires_at = ?")
+                params.append(last_auth_context_expires_at)
+
+            if last_auth_page_url is not None:
+                updates.append("last_auth_page_url = ?")
+                params.append(last_auth_page_url)
 
             if updates:
                 params.append(token_id)
@@ -1162,9 +1426,24 @@ class Database:
         """Create a new task"""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
-                INSERT INTO tasks (task_id, token_id, model, prompt, status, progress)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (task.task_id, task.token_id, task.model, task.prompt, task.status, task.progress))
+                INSERT INTO tasks (
+                    task_id, token_id, model, prompt, status, progress,
+                    current_stage, failure_stage, error_code, error_category, last_event_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                task.task_id,
+                task.token_id,
+                task.model,
+                task.prompt,
+                task.status,
+                task.progress,
+                task.current_stage,
+                task.failure_stage,
+                task.error_code,
+                task.error_category,
+                task.last_event_at,
+            ))
             await db.commit()
             return cursor.lastrowid
     
@@ -1179,6 +1458,38 @@ class Database:
                 WHERE task_id = ?
             """, (status, progress, result_urls, error_message, completed_at, task_id))
             await db.commit()
+
+    async def update_task_stage(
+        self,
+        task_id: str,
+        current_stage: Optional[str] = None,
+        failure_stage: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_category: Optional[str] = None
+    ):
+        """Update task stage attribution."""
+        async with aiosqlite.connect(self.db_path) as db:
+            updates = []
+            params = []
+            if current_stage is not None:
+                updates.append("current_stage = ?")
+                params.append(current_stage)
+            if failure_stage is not None:
+                updates.append("failure_stage = ?")
+                params.append(failure_stage)
+            if error_code is not None:
+                updates.append("error_code = ?")
+                params.append(error_code)
+            if error_category is not None:
+                updates.append("error_category = ?")
+                params.append(error_category)
+
+            if updates:
+                updates.append("last_event_at = CURRENT_TIMESTAMP")
+                params.append(task_id)
+                query = f"UPDATE tasks SET {', '.join(updates)} WHERE task_id = ?"
+                await db.execute(query, params)
+                await db.commit()
     
     async def get_task(self, task_id: str) -> Optional[Task]:
         """Get task by ID"""
@@ -1195,10 +1506,23 @@ class Database:
         """Log a request and return log ID"""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
-                INSERT INTO request_logs (token_id, task_id, operation, request_body, response_body, status_code, duration)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (log.token_id, log.task_id, log.operation, log.request_body, log.response_body,
-                  log.status_code, log.duration))
+                INSERT INTO request_logs (
+                    token_id, task_id, operation, request_body, response_body,
+                    stage, trigger_source, is_redacted, status_code, duration
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                log.token_id,
+                log.task_id,
+                log.operation,
+                log.request_body,
+                log.response_body,
+                log.stage,
+                log.trigger_source,
+                log.is_redacted,
+                log.status_code,
+                log.duration,
+            ))
             await db.commit()
             return cursor.lastrowid
 
@@ -1248,6 +1572,9 @@ class Database:
                     rl.operation,
                     rl.request_body,
                     rl.response_body,
+                    rl.stage,
+                    rl.trigger_source,
+                    rl.is_redacted,
                     rl.status_code,
                     rl.duration,
                     rl.created_at,
@@ -1266,6 +1593,203 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM request_logs")
             await db.commit()
+
+    async def update_token_browser_state(
+        self,
+        token_id: int,
+        browser_provider: Optional[str] = None,
+        browser_profile_id: Optional[str] = None,
+        sora_available: Optional[bool] = None,
+        account_status: Optional[str] = None,
+        last_auth_refresh_at: Optional[datetime] = None,
+        last_auth_result: Optional[str] = None,
+        last_auth_error_reason: Optional[str] = None,
+        last_challenge_reason: Optional[str] = None,
+        last_browser_user_agent: Optional[str] = None,
+        last_device_id: Optional[str] = None,
+        last_egress_binding: Optional[str] = None,
+        last_auth_context_hash: Optional[str] = None,
+        last_auth_context_expires_at: Optional[datetime] = None,
+        last_auth_page_url: Optional[str] = None,
+    ):
+        """Persist browser binding and auth snapshot metadata for a token."""
+        await self.update_token(
+            token_id=token_id,
+            browser_provider=browser_provider,
+            browser_profile_id=browser_profile_id,
+            sora_available=sora_available,
+            account_status=account_status,
+            last_auth_refresh_at=last_auth_refresh_at,
+            last_auth_result=last_auth_result,
+            last_auth_error_reason=last_auth_error_reason,
+            last_challenge_reason=last_challenge_reason,
+            last_browser_user_agent=last_browser_user_agent,
+            last_device_id=last_device_id,
+            last_egress_binding=last_egress_binding,
+            last_auth_context_hash=last_auth_context_hash,
+            last_auth_context_expires_at=last_auth_context_expires_at,
+            last_auth_page_url=last_auth_page_url,
+        )
+
+    async def create_mutation_attempt(
+        self,
+        token_id: Optional[int],
+        task_id: Optional[str],
+        mutation_type: str,
+        strategy: str,
+        stage: str,
+        status: str,
+        provider: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        window_id: Optional[str] = None,
+        page_url: Optional[str] = None,
+        egress_binding: Optional[str] = None,
+        details: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_reason: Optional[str] = None,
+    ) -> int:
+        """Create a structured mutation attempt record."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                INSERT INTO mutation_attempts (
+                    token_id, task_id, mutation_type, strategy, stage, status,
+                    provider, profile_id, window_id, page_url, egress_binding,
+                    details, error_code, error_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                token_id,
+                task_id,
+                mutation_type,
+                strategy,
+                stage,
+                status,
+                provider,
+                profile_id,
+                window_id,
+                page_url,
+                egress_binding,
+                details,
+                error_code,
+                error_reason,
+            ))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def update_mutation_attempt(
+        self,
+        attempt_id: int,
+        task_id: Optional[str] = None,
+        stage: Optional[str] = None,
+        status: Optional[str] = None,
+        window_id: Optional[str] = None,
+        page_url: Optional[str] = None,
+        egress_binding: Optional[str] = None,
+        details: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_reason: Optional[str] = None,
+    ):
+        """Update a mutation attempt record."""
+        async with aiosqlite.connect(self.db_path) as db:
+            updates = []
+            params = []
+            if task_id is not None:
+                updates.append("task_id = ?")
+                params.append(task_id)
+            if stage is not None:
+                updates.append("stage = ?")
+                params.append(stage)
+            if status is not None:
+                updates.append("status = ?")
+                params.append(status)
+            if window_id is not None:
+                updates.append("window_id = ?")
+                params.append(window_id)
+            if page_url is not None:
+                updates.append("page_url = ?")
+                params.append(page_url)
+            if egress_binding is not None:
+                updates.append("egress_binding = ?")
+                params.append(egress_binding)
+            if details is not None:
+                updates.append("details = ?")
+                params.append(details)
+            if error_code is not None:
+                updates.append("error_code = ?")
+                params.append(error_code)
+            if error_reason is not None:
+                updates.append("error_reason = ?")
+                params.append(error_reason)
+            if updates:
+                updates.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(attempt_id)
+                query = f"UPDATE mutation_attempts SET {', '.join(updates)} WHERE id = ?"
+                await db.execute(query, params)
+                await db.commit()
+
+    async def create_task_event(
+        self,
+        task_id: Optional[str],
+        token_id: Optional[int],
+        event_type: str,
+        stage: Optional[str],
+        status: str,
+        message: Optional[str] = None,
+        details: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_reason: Optional[str] = None,
+    ) -> int:
+        """Create a structured task event."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                INSERT INTO task_events (
+                    task_id, token_id, event_type, stage, status,
+                    message, details, error_code, error_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                task_id,
+                token_id,
+                event_type,
+                stage,
+                status,
+                message,
+                details,
+                error_code,
+                error_reason,
+            ))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def create_error_attribution(
+        self,
+        task_id: Optional[str],
+        token_id: Optional[int],
+        mutation_type: Optional[str],
+        stage: str,
+        error_code: Optional[str],
+        error_reason: Optional[str],
+        details: Optional[str] = None,
+    ) -> int:
+        """Create an error attribution record."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                INSERT INTO error_attributions (
+                    task_id, token_id, mutation_type, stage,
+                    error_code, error_reason, details
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                task_id,
+                token_id,
+                mutation_type,
+                stage,
+                error_code,
+                error_reason,
+                details,
+            ))
+            await db.commit()
+            return cursor.lastrowid
 
     # Admin config operations
     async def get_admin_config(self) -> AdminConfig:
