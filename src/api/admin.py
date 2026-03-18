@@ -231,10 +231,26 @@ async def logout(token: str = Depends(verify_admin_token)):
 async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
     """Get all tokens with statistics"""
     tokens = await token_manager.get_all_tokens()
+    active_tokens = [item for item in tokens if item.is_active]
+    active_count = len(active_tokens)
+    profile_counts = {}
+    for item in active_tokens:
+        if item.browser_profile_id:
+            profile_counts[item.browser_profile_id] = profile_counts.get(item.browser_profile_id, 0) + 1
     result = []
 
     for token in tokens:
         stats = await db.get_token_stats(token.id)
+        if token.browser_profile_id and profile_counts.get(token.browser_profile_id, 0) > 1:
+            binding_status = "duplicate_profile_binding"
+        elif token.browser_profile_id:
+            binding_status = "bound"
+        elif token.is_active and config.browser_default_profile_id and active_count == 1:
+            binding_status = "bootstrap_default"
+        elif token.is_active and config.browser_default_profile_id and active_count > 1:
+            binding_status = "misconfigured"
+        else:
+            binding_status = "unbound"
         result.append({
             "id": token.id,
             "token": None,
@@ -285,6 +301,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
             # 浏览器绑定与账号态
             "browser_provider": token.browser_provider,
             "browser_profile_id": token.browser_profile_id,
+            "binding_status": binding_status,
             "sora_available": token.sora_available,
             "account_status": token.account_status,
             "last_auth_refresh_at": token.last_auth_refresh_at.isoformat() if token.last_auth_refresh_at else None,
@@ -294,6 +311,10 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
             "last_browser_user_agent": token.last_browser_user_agent,
             "last_device_id": _masked_secret(token.last_device_id),
             "last_egress_binding": token.last_egress_binding,
+            "last_egress_status": token.last_egress_status,
+            "last_egress_probe_at": token.last_egress_probe_at.isoformat() if token.last_egress_probe_at else None,
+            "last_egress_probe_details": debug_logger.sanitize_json_text(token.last_egress_probe_details),
+            "egress_status": token.last_egress_status or "unverified",
             "last_auth_context_hash": token.last_auth_context_hash,
             "last_auth_context_expires_at": token.last_auth_context_expires_at.isoformat() if token.last_auth_context_expires_at else None,
             "last_auth_page_url": token.last_auth_page_url,
@@ -1155,7 +1176,7 @@ async def get_logs(limit: int = 100, token: str = Depends(verify_admin_token)):
     result = []
     for log in logs:
         # Convert UTC time to local timezone
-        created_at = log.get("created_at")
+        created_at = log.get("event_at") or log.get("updated_at") or log.get("created_at")
         if created_at:
             created_at = convert_utc_to_local(created_at)
 

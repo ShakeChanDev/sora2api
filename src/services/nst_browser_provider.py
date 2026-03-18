@@ -23,6 +23,7 @@ from .browser_provider import (
     BrowserProviderError,
     BrowserReadinessError,
     EgressBinding,
+    EgressProbeObservation,
 )
 
 
@@ -216,6 +217,37 @@ class NSTBrowserProvider(BrowserProvider):
                 ordered.append(f"{name}={value}")
         return "; ".join(ordered)
 
+    async def _probe_page_egress(self, page) -> Optional[EgressProbeObservation]:
+        if not config.egress_probe_url:
+            return None
+        script = """
+        async (probeUrl) => {
+            const response = await fetch(probeUrl, {
+                method: 'GET',
+                credentials: 'omit',
+                cache: 'no-store',
+                headers: { 'Accept': 'application/json', 'Cache-Control': 'no-store' },
+            });
+            const text = await response.text();
+            let payload = null;
+            try {
+                payload = JSON.parse(text);
+            } catch (error) {
+                payload = null;
+            }
+            return { status: response.status, payload, text };
+        }
+        """
+        try:
+            result = await page.evaluate(script, config.egress_probe_url)
+        except PlaywrightError as exc:
+            debug_logger.log_warning(f"[NSTBrowser] Page egress probe failed: {exc}")
+            return None
+        if result.get("status") != 200 or not isinstance(result.get("payload"), dict):
+            debug_logger.log_warning(f"[NSTBrowser] Page egress probe returned {result.get('status')}")
+            return None
+        return EgressProbeObservation.from_payload(result.get("payload"))
+
     async def refresh_auth_context(
         self,
         connection: BrowserConnection,
@@ -327,11 +359,14 @@ class NSTBrowserProvider(BrowserProvider):
                     device_id = cookie.get("value")
                     break
 
+        browser_probe = await self._probe_page_egress(page)
+
         egress_binding = EgressBinding(
             provider=self.provider_name,
             profile_id=connection.profile_id,
             proxy_url=connection.proxy_url,
             page_url=result.get("pageUrl") or connection.page.url,
+            browser_observation=browser_probe,
             same_network_identity_proven=False,
         )
 

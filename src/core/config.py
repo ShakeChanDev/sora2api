@@ -4,6 +4,8 @@ import tomli
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+from .secret_codec import secret_codec
+
 class Config:
     """Application configuration"""
 
@@ -11,6 +13,7 @@ class Config:
         self._config = self._load_config()
         self._admin_username: Optional[str] = None
         self._admin_password: Optional[str] = None
+        secret_codec.configure(os.getenv("SORA2API_SECRET_KEY", ""))
     
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from setting.toml"""
@@ -384,15 +387,39 @@ class Config:
         return int(self._config.get("browser", {}).get("auth_max_age_seconds", 120))
 
     @property
+    def browser_enforce_token_profile_binding(self) -> bool:
+        """Whether high-risk mutations require token-scoped profile binding when multiple active tokens exist."""
+        return bool(self._config.get("browser", {}).get("enforce_token_profile_binding", True))
+
+    @property
     def nst_browser_base_url(self) -> str:
         """NSTBrowser local API base URL."""
         return self._config.get("nst_browser", {}).get("base_url", "http://127.0.0.1:8848/api/v2")
 
     @property
     def nst_browser_api_key(self) -> str:
-        """NSTBrowser local API key."""
-        configured = self._config.get("nst_browser", {}).get("api_key", "")
-        return configured or os.getenv("NST_BROWSER_API_KEY", "")
+        """NSTBrowser local API key. Env-only to avoid committed secrets."""
+        return os.getenv("NST_BROWSER_API_KEY", "")
+
+    @property
+    def secret_key(self) -> str:
+        """Application secret key used for field encryption."""
+        return os.getenv("SORA2API_SECRET_KEY", "")
+
+    @property
+    def secret_encryption_enabled(self) -> bool:
+        """Whether secret encryption is enabled."""
+        return bool(secret_codec.is_configured)
+
+    @property
+    def egress_probe_url(self) -> str:
+        """Optional HTTPS endpoint that returns network identity JSON."""
+        return self._config.get("egress_probe", {}).get("url", "")
+
+    @property
+    def egress_probe_timeout_ms(self) -> int:
+        """Timeout for browser/server egress probes."""
+        return int(self._config.get("egress_probe", {}).get("timeout_ms", 8000))
 
 # Global config instance
 config = Config()

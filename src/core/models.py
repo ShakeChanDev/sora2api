@@ -7,6 +7,7 @@ class Token(BaseModel):
     """Token model"""
     id: Optional[int] = None
     token: str
+    token_hash: Optional[str] = None
     email: str
     name: Optional[str] = ""
     st: Optional[str] = None
@@ -54,6 +55,9 @@ class Token(BaseModel):
     last_browser_user_agent: Optional[str] = None
     last_device_id: Optional[str] = None
     last_egress_binding: Optional[str] = None
+    last_egress_status: Optional[str] = None
+    last_egress_probe_at: Optional[datetime] = None
+    last_egress_probe_details: Optional[str] = None
     last_auth_context_hash: Optional[str] = None
     last_auth_context_expires_at: Optional[datetime] = None
     last_auth_page_url: Optional[str] = None
@@ -88,6 +92,8 @@ class Task(BaseModel):
     failure_stage: Optional[str] = None
     error_code: Optional[str] = None
     error_category: Optional[str] = None
+    auth_snapshot_id: Optional[str] = None
+    polling_context: Optional[str] = None
     last_event_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None

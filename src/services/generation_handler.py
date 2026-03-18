@@ -12,6 +12,8 @@ from .token_manager import TokenManager
 from .load_balancer import LoadBalancer
 from .file_cache import FileCache
 from .concurrency_manager import ConcurrencyManager
+from .browser_provider import MutationResult, PollingContext
+from .polling_client import PollingClient, PollingClientError
 from ..core.database import Database
 from ..core.models import Task, RequestLog
 from ..core.config import config
@@ -232,12 +234,14 @@ class GenerationHandler:
 
     def __init__(self, sora_client: SoraClient, token_manager: TokenManager,
                  load_balancer: LoadBalancer, db: Database, proxy_manager=None,
-                 concurrency_manager: Optional[ConcurrencyManager] = None):
+                 concurrency_manager: Optional[ConcurrencyManager] = None,
+                 polling_client: Optional[PollingClient] = None):
         self.sora_client = sora_client
         self.token_manager = token_manager
         self.load_balancer = load_balancer
         self.db = db
         self.concurrency_manager = concurrency_manager
+        self.polling_client = polling_client
         self.file_cache = FileCache(
             cache_dir="tmp",
             default_timeout=config.cache_timeout,
@@ -653,7 +657,7 @@ class GenerationHandler:
                     formatted_prompt = self.sora_client.format_storyboard_prompt(clean_prompt)
                     debug_logger.log_info(f"Storyboard mode detected. Formatted prompt: {formatted_prompt}")
 
-                    task_id = await self.sora_client.generate_storyboard(
+                    task_result = await self.sora_client.generate_storyboard(
                         formatted_prompt, token_obj.token,
                         orientation=model_config["orientation"],
                         media_id=media_id,
@@ -661,13 +665,14 @@ class GenerationHandler:
                         style_id=style_id,
                         token_id=token_obj.id
                     )
+                    task_id, submission = self._extract_mutation_submission(task_result)
                 else:
                     # Normal video generation
                     # Get model and size from config (default to sy_8 and small for backward compatibility)
                     sora_model = model_config.get("model", "sy_8")
                     video_size = model_config.get("size", "small")
 
-                    task_id = await self.sora_client.generate_video(
+                    task_result = await self.sora_client.generate_video(
                         clean_prompt, token_obj.token,
                         orientation=model_config["orientation"],
                         media_id=media_id,
@@ -677,6 +682,7 @@ class GenerationHandler:
                         size=video_size,
                         token_id=token_obj.id
                     )
+                    task_id, submission = self._extract_mutation_submission(task_result)
             else:
                 task_id = await self.sora_client.generate_image(
                     prompt, token_obj.token,
@@ -685,6 +691,7 @@ class GenerationHandler:
                     media_id=media_id,
                     token_id=token_obj.id
                 )
+                submission = None
 
             # Save task to database
             task = Task(
@@ -694,7 +701,9 @@ class GenerationHandler:
                 prompt=prompt,
                 status="processing",
                 progress=0.0,
-                current_stage="polling"
+                current_stage="polling",
+                auth_snapshot_id=submission.auth_snapshot_id if submission else None,
+                polling_context=self._serialize_polling_context(submission),
             )
             await self.db.create_task(task)
 
@@ -706,7 +715,17 @@ class GenerationHandler:
             await self.token_manager.record_usage(token_obj.id, is_video=is_video)
             
             # Poll for results with timeout
-            async for chunk in self._poll_task_result(task_id, token_obj.token, is_video, stream, prompt, token_obj.id, log_id, start_time):
+            async for chunk in self._poll_task_result(
+                task_id,
+                token_obj.token,
+                is_video,
+                stream,
+                prompt,
+                token_obj.id,
+                log_id,
+                start_time,
+                polling_context=submission.polling_context if submission else None,
+            ):
                 yield chunk
             
             # Record success
@@ -936,7 +955,8 @@ class GenerationHandler:
 
     async def _poll_task_result(self, task_id: str, token: str, is_video: bool,
                                 stream: bool, prompt: str, token_id: int = None,
-                                log_id: int = None, start_time: float = None) -> AsyncGenerator[str, None]:
+                                log_id: int = None, start_time: float = None,
+                                polling_context: Optional[PollingContext] = None) -> AsyncGenerator[str, None]:
         """Poll for task result with timeout"""
         # Get timeout from config
         timeout = config.video_timeout if is_video else config.image_timeout
@@ -999,8 +1019,25 @@ class GenerationHandler:
 
             try:
                 if is_video:
+                    if self.polling_client and polling_context is None:
+                        polling_context = await self.polling_client.load_task_polling_context(task_id)
+
                     # Get pending tasks to check progress
-                    pending_tasks = await self.sora_client.get_pending_tasks(token, token_id=token_id)
+                    await self.db.update_task_stage(task_id, current_stage="polling")
+                    if self.polling_client:
+                        pending_tasks, polling_context = await self.polling_client.get_pending_tasks(
+                            task_id=task_id,
+                            token_id=token_id,
+                            access_token=token,
+                            polling_context=polling_context,
+                        )
+                        if polling_context:
+                            await self.db.update_task_polling_context(
+                                task_id,
+                                json.dumps(polling_context.to_dict(), ensure_ascii=False),
+                            )
+                    else:
+                        pending_tasks = await self.sora_client.get_pending_tasks(token, token_id=token_id)
 
                     # Find matching task in pending tasks
                     task_found = False
@@ -1035,7 +1072,21 @@ class GenerationHandler:
                     # If task not found in pending tasks, it's completed - fetch from drafts
                     if not task_found:
                         debug_logger.log_info(f"Task {task_id} not found in pending tasks, fetching from drafts...")
-                        result = await self.sora_client.get_video_drafts(token, token_id=token_id)
+                        await self.db.update_task_stage(task_id, current_stage="drafts_lookup")
+                        if self.polling_client:
+                            result, polling_context = await self.polling_client.get_video_drafts(
+                                task_id=task_id,
+                                token_id=token_id,
+                                access_token=token,
+                                polling_context=polling_context,
+                            )
+                            if polling_context:
+                                await self.db.update_task_polling_context(
+                                    task_id,
+                                    json.dumps(polling_context.to_dict(), ensure_ascii=False),
+                                )
+                        else:
+                            result = await self.sora_client.get_video_drafts(token, token_id=token_id)
                         items = result.get("items", [])
 
                         # Find matching task in drafts
@@ -1275,6 +1326,7 @@ class GenerationHandler:
                                             )
 
                                 # Task completed
+                                await self.db.update_task_stage(task_id, current_stage="result_ready")
                                 await self.db.update_task(
                                     task_id, "completed", 100.0,
                                     result_urls=json.dumps([local_url])
@@ -1346,6 +1398,7 @@ class GenerationHandler:
                                                 reasoning_content="Cache is disabled. Using original URLs directly...\n"
                                             )
 
+                                    await self.db.update_task_stage(task_id, current_stage="result_ready")
                                     await self.db.update_task(
                                         task_id, "completed", 100.0,
                                         result_urls=json.dumps(local_urls)
@@ -1407,6 +1460,17 @@ class GenerationHandler:
                         )
             
             except Exception as e:
+                if isinstance(e, PollingClientError) and e.code == "polling_auth_refresh_failed":
+                    await self.db.update_task_stage(
+                        task_id,
+                        current_stage="polling",
+                        failure_stage="polling",
+                        error_code=e.code,
+                        error_category="polling_auth",
+                    )
+                    await self.db.update_task(task_id, "failed", last_progress, error_message=str(e))
+                    raise
+
                 # Check for CF shield/429 error - don't retry these
                 error_str = str(e)
                 is_cf_or_429 = False
@@ -1590,6 +1654,17 @@ class GenerationHandler:
             # Don't fail the request if logging fails
             print(f"Failed to log request: {e}")
             return None
+
+    def _extract_mutation_submission(self, result) -> tuple[str, Optional[MutationResult]]:
+        """Normalize legacy string task ids and new MutationResult payloads."""
+        if isinstance(result, MutationResult):
+            return result.task_id or "", result
+        return str(result), None
+
+    def _serialize_polling_context(self, submission: Optional[MutationResult]) -> Optional[str]:
+        if not submission or not submission.polling_context:
+            return None
+        return json.dumps(submission.polling_context.to_dict(), ensure_ascii=False)
 
     # ==================== Prompt Enhancement Handler ====================
 
@@ -2176,7 +2251,7 @@ class GenerationHandler:
             sora_model = model_config.get("model", "sy_8")
             video_size = model_config.get("size", "small")
 
-            task_id = await self.sora_client.generate_video(
+            task_result = await self.sora_client.generate_video(
                 full_prompt, token_obj.token,
                 orientation=model_config["orientation"],
                 n_frames=n_frames,
@@ -2184,6 +2259,7 @@ class GenerationHandler:
                 size=video_size,
                 token_id=token_obj.id
             )
+            task_id, submission = self._extract_mutation_submission(task_result)
             debug_logger.log_info(f"Video generation started, task_id: {task_id}")
 
             # Save task to database
@@ -2194,7 +2270,9 @@ class GenerationHandler:
                 prompt=full_prompt,
                 status="processing",
                 progress=0.0,
-                current_stage="polling"
+                current_stage="polling",
+                auth_snapshot_id=submission.auth_snapshot_id if submission else None,
+                polling_context=self._serialize_polling_context(submission),
             )
             await self.db.create_task(task)
 
@@ -2202,7 +2280,15 @@ class GenerationHandler:
             await self.token_manager.record_usage(token_obj.id, is_video=True)
 
             # Poll for results
-            async for chunk in self._poll_task_result(task_id, token_obj.token, True, True, full_prompt, token_obj.id):
+            async for chunk in self._poll_task_result(
+                task_id,
+                token_obj.token,
+                True,
+                True,
+                full_prompt,
+                token_obj.id,
+                polling_context=submission.polling_context if submission else None,
+            ):
                 yield chunk
 
             # Record success
@@ -2308,7 +2394,7 @@ class GenerationHandler:
             yield self._format_stream_chunk(
                 reasoning_content="Sending remix request to server...\n"
             )
-            task_id = await self.sora_client.remix_video(
+            task_result = await self.sora_client.remix_video(
                 remix_target_id=remix_target_id,
                 prompt=clean_prompt,
                 token=token_obj.token,
@@ -2317,6 +2403,7 @@ class GenerationHandler:
                 style_id=style_id,
                 token_id=token_obj.id
             )
+            task_id, submission = self._extract_mutation_submission(task_result)
             debug_logger.log_info(f"Remix generation started, task_id: {task_id}")
 
             # Save task to database
@@ -2327,7 +2414,9 @@ class GenerationHandler:
                 prompt=f"remix:{remix_target_id} {clean_prompt}",
                 status="processing",
                 progress=0.0,
-                current_stage="polling"
+                current_stage="polling",
+                auth_snapshot_id=submission.auth_snapshot_id if submission else None,
+                polling_context=self._serialize_polling_context(submission),
             )
             await self.db.create_task(task)
 
@@ -2335,7 +2424,15 @@ class GenerationHandler:
             await self.token_manager.record_usage(token_obj.id, is_video=True)
 
             # Poll for results
-            async for chunk in self._poll_task_result(task_id, token_obj.token, True, True, clean_prompt, token_obj.id):
+            async for chunk in self._poll_task_result(
+                task_id,
+                token_obj.token,
+                True,
+                True,
+                clean_prompt,
+                token_obj.id,
+                polling_context=submission.polling_context if submission else None,
+            ):
                 yield chunk
 
             # Record success
@@ -2417,13 +2514,14 @@ class GenerationHandler:
                 )
             )
 
-            task_id = await self.sora_client.extend_video(
+            task_result = await self.sora_client.extend_video(
                 generation_id=generation_id,
                 prompt=clean_prompt,
                 extension_duration_s=extension_duration_s,
                 token=token_obj.token,
                 token_id=token_obj.id
             )
+            task_id, submission = self._extract_mutation_submission(task_result)
             debug_logger.log_info(f"Video extension started, task_id: {task_id}")
 
             task = Task(
@@ -2433,7 +2531,9 @@ class GenerationHandler:
                 prompt=f"extend:{generation_id} {clean_prompt}",
                 status="processing",
                 progress=0.0,
-                current_stage="polling"
+                current_stage="polling",
+                auth_snapshot_id=submission.auth_snapshot_id if submission else None,
+                polling_context=self._serialize_polling_context(submission),
             )
             await self.db.create_task(task)
             if log_id:
@@ -2441,7 +2541,15 @@ class GenerationHandler:
 
             await self.token_manager.record_usage(token_obj.id, is_video=True)
 
-            async for chunk in self._poll_task_result(task_id, token_obj.token, True, True, clean_prompt, token_obj.id):
+            async for chunk in self._poll_task_result(
+                task_id,
+                token_obj.token,
+                True,
+                True,
+                clean_prompt,
+                token_obj.id,
+                polling_context=submission.polling_context if submission else None,
+            ):
                 yield chunk
 
             await self.token_manager.record_success(token_obj.id, is_video=True)

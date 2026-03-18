@@ -1,6 +1,7 @@
 """Debug logger module for detailed API request/response logging"""
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,10 @@ class DebugLogger:
         """Setup file logger"""
         # Clear log file on startup
         if self.log_file.exists():
-            self.log_file.unlink()
+            try:
+                self.log_file.unlink()
+            except PermissionError:
+                self.log_file = Path(f"logs-{os.getpid()}.txt")
 
         # Create logger
         self.logger = logging.getLogger("debug_logger")

@@ -2,7 +2,7 @@
 import aiosqlite
 import json
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 from .models import (
     Token,
@@ -19,6 +19,7 @@ from .models import (
     TaskEvent,
     ErrorAttribution,
 )
+from .secret_codec import secret_codec
 
 class Database:
     """SQLite database manager"""
@@ -34,6 +35,30 @@ class Database:
     def db_exists(self) -> bool:
         """Check if database file exists"""
         return Path(self.db_path).exists()
+
+    def _serialize_token_secret(self, value: Optional[str]) -> Optional[str]:
+        return secret_codec.encrypt(value)
+
+    def _deserialize_token_secret(self, value: Optional[str]) -> Optional[str]:
+        return secret_codec.decrypt(value)
+
+    def _serialize_polling_context(self, value: Optional[str]) -> Optional[str]:
+        return secret_codec.encrypt(value)
+
+    def _deserialize_polling_context(self, value: Optional[str]) -> Optional[str]:
+        return secret_codec.decrypt(value)
+
+    def _decode_token_row(self, row: Dict[str, Any]) -> Token:
+        payload = dict(row)
+        payload["token"] = self._deserialize_token_secret(payload.get("token"))
+        payload["st"] = self._deserialize_token_secret(payload.get("st"))
+        payload["rt"] = self._deserialize_token_secret(payload.get("rt"))
+        return Token(**payload)
+
+    def _decode_task_row(self, row: Dict[str, Any]) -> Task:
+        payload = dict(row)
+        payload["polling_context"] = self._deserialize_polling_context(payload.get("polling_context"))
+        return Task(**payload)
 
     async def _table_exists(self, db, table_name: str) -> bool:
         """Check if a table exists in the database"""
@@ -313,6 +338,7 @@ class Database:
                     ("image_concurrency", "INTEGER DEFAULT -1"),
                     ("video_concurrency", "INTEGER DEFAULT -1"),
                     ("client_id", "TEXT"),
+                    ("token_hash", "TEXT"),
                     ("proxy_url", "TEXT"),
                     ("is_expired", "BOOLEAN DEFAULT 0"),
                     ("browser_provider", "TEXT"),
@@ -326,6 +352,9 @@ class Database:
                     ("last_browser_user_agent", "TEXT"),
                     ("last_device_id", "TEXT"),
                     ("last_egress_binding", "TEXT"),
+                    ("last_egress_status", "TEXT"),
+                    ("last_egress_probe_at", "TIMESTAMP"),
+                    ("last_egress_probe_details", "TEXT"),
                     ("last_auth_context_hash", "TEXT"),
                     ("last_auth_context_expires_at", "TIMESTAMP"),
                     ("last_auth_page_url", "TEXT"),
@@ -336,6 +365,35 @@ class Database:
                         try:
                             await db.execute(f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}")
                             print(f"  ✓ Added column '{col_name}' to tokens table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+                if await self._column_exists(db, "tokens", "token_hash"):
+                    try:
+                        cursor = await db.execute("SELECT id, token FROM tokens WHERE token_hash IS NULL")
+                        rows = await cursor.fetchall()
+                        for token_id, stored_token in rows:
+                            try:
+                                plain_token = self._deserialize_token_secret(stored_token)
+                            except RuntimeError:
+                                continue
+                            await db.execute(
+                                "UPDATE tokens SET token_hash = ? WHERE id = ?",
+                                (secret_codec.hash_secret(plain_token), token_id),
+                            )
+                    except Exception as e:
+                        print(f"  ✗ Failed to backfill token_hash: {e}")
+
+            if await self._table_exists(db, "tasks"):
+                task_columns_to_add = [
+                    ("auth_snapshot_id", "TEXT"),
+                    ("polling_context", "TEXT"),
+                ]
+                for col_name, col_type in task_columns_to_add:
+                    if not await self._column_exists(db, "tasks", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to tasks table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
 
@@ -593,6 +651,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS tokens (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     token TEXT UNIQUE NOT NULL,
+                    token_hash TEXT,
                     email TEXT NOT NULL,
                     username TEXT NOT NULL,
                     name TEXT NOT NULL,
@@ -633,6 +692,9 @@ class Database:
                     last_browser_user_agent TEXT,
                     last_device_id TEXT,
                     last_egress_binding TEXT,
+                    last_egress_status TEXT,
+                    last_egress_probe_at TIMESTAMP,
+                    last_egress_probe_details TEXT,
                     last_auth_context_hash TEXT,
                     last_auth_context_expires_at TIMESTAMP,
                     last_auth_page_url TEXT
@@ -673,6 +735,8 @@ class Database:
                     failure_stage TEXT,
                     error_code TEXT,
                     error_category TEXT,
+                    auth_snapshot_id TEXT,
+                    polling_context TEXT,
                     last_event_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP,
@@ -963,17 +1027,22 @@ class Database:
         """Add a new token"""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
-                INSERT INTO tokens (token, email, username, name, st, rt, client_id, proxy_url, remark, expiry_time, is_active,
+                INSERT INTO tokens (token, token_hash, email, username, name, st, rt, client_id, proxy_url, remark, expiry_time, is_active,
                                    plan_type, plan_title, subscription_end, sora2_supported, sora2_invite_code,
                                    sora2_redeemed_count, sora2_total_count, sora2_remaining_count, sora2_cooldown_until,
                                    image_enabled, video_enabled, image_concurrency, video_concurrency,
                                    browser_provider, browser_profile_id, sora_available, account_status,
                                    last_auth_refresh_at, last_auth_result, last_auth_error_reason,
                                    last_challenge_reason, last_browser_user_agent, last_device_id,
-                                   last_egress_binding, last_auth_context_hash, last_auth_context_expires_at,
+                                   last_egress_binding, last_egress_status, last_egress_probe_at, last_egress_probe_details,
+                                   last_auth_context_hash, last_auth_context_expires_at,
                                    last_auth_page_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (token.token, token.email, "", token.name, token.st, token.rt, token.client_id, token.proxy_url,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                  self._serialize_token_secret(token.token),
+                  secret_codec.hash_secret(token.token),
+                  token.email, "", token.name,
+                  self._serialize_token_secret(token.st), self._serialize_token_secret(token.rt), token.client_id, token.proxy_url,
                   token.remark, token.expiry_time, token.is_active,
                   token.plan_type, token.plan_title, token.subscription_end,
                   token.sora2_supported, token.sora2_invite_code,
@@ -984,7 +1053,8 @@ class Database:
                   token.browser_provider, token.browser_profile_id, token.sora_available, token.account_status,
                   token.last_auth_refresh_at, token.last_auth_result, token.last_auth_error_reason,
                   token.last_challenge_reason, token.last_browser_user_agent, token.last_device_id,
-                  token.last_egress_binding, token.last_auth_context_hash, token.last_auth_context_expires_at,
+                  token.last_egress_binding, token.last_egress_status, token.last_egress_probe_at, token.last_egress_probe_details,
+                  token.last_auth_context_hash, token.last_auth_context_expires_at,
                   token.last_auth_page_url))
             await db.commit()
             token_id = cursor.lastrowid
@@ -1004,17 +1074,20 @@ class Database:
             cursor = await db.execute("SELECT * FROM tokens WHERE id = ?", (token_id,))
             row = await cursor.fetchone()
             if row:
-                return Token(**dict(row))
+                return self._decode_token_row(dict(row))
             return None
     
     async def get_token_by_value(self, token: str) -> Optional[Token]:
         """Get token by value"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM tokens WHERE token = ?", (token,))
+            cursor = await db.execute(
+                "SELECT * FROM tokens WHERE token_hash = ? OR token = ?",
+                (secret_codec.hash_secret(token), token),
+            )
             row = await cursor.fetchone()
             if row:
-                return Token(**dict(row))
+                return self._decode_token_row(dict(row))
             return None
 
     async def get_token_by_email(self, email: str) -> Optional[Token]:
@@ -1024,7 +1097,7 @@ class Database:
             cursor = await db.execute("SELECT * FROM tokens WHERE email = ?", (email,))
             row = await cursor.fetchone()
             if row:
-                return Token(**dict(row))
+                return self._decode_token_row(dict(row))
             return None
     
     async def get_active_tokens(self) -> List[Token]:
@@ -1039,7 +1112,7 @@ class Database:
                 ORDER BY last_used_at ASC NULLS FIRST
             """)
             rows = await cursor.fetchall()
-            return [Token(**dict(row)) for row in rows]
+            return [self._decode_token_row(dict(row)) for row in rows]
     
     async def get_all_tokens(self) -> List[Token]:
         """Get all tokens"""
@@ -1047,7 +1120,19 @@ class Database:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM tokens ORDER BY created_at DESC")
             rows = await cursor.fetchall()
-            return [Token(**dict(row)) for row in rows]
+            return [self._decode_token_row(dict(row)) for row in rows]
+
+    async def count_active_tokens(self) -> int:
+        """Count active tokens eligible for selection."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                SELECT COUNT(*) FROM tokens
+                WHERE is_active = 1
+                AND (cooled_until IS NULL OR cooled_until < CURRENT_TIMESTAMP)
+                AND expiry_time > CURRENT_TIMESTAMP
+            """)
+            row = await cursor.fetchone()
+            return int(row[0] if row else 0)
     
     async def update_token_usage(self, token_id: int):
         """Update token usage"""
@@ -1159,6 +1244,9 @@ class Database:
                           last_browser_user_agent: Optional[str] = None,
                           last_device_id: Optional[str] = None,
                           last_egress_binding: Optional[str] = None,
+                          last_egress_status: Optional[str] = None,
+                          last_egress_probe_at: Optional[datetime] = None,
+                          last_egress_probe_details: Optional[str] = None,
                           last_auth_context_hash: Optional[str] = None,
                           last_auth_context_expires_at: Optional[datetime] = None,
                           last_auth_page_url: Optional[str] = None):
@@ -1170,15 +1258,17 @@ class Database:
 
             if token is not None:
                 updates.append("token = ?")
-                params.append(token)
+                params.append(self._serialize_token_secret(token))
+                updates.append("token_hash = ?")
+                params.append(secret_codec.hash_secret(token))
 
             if st is not None:
                 updates.append("st = ?")
-                params.append(st)
+                params.append(self._serialize_token_secret(st))
 
             if rt is not None:
                 updates.append("rt = ?")
-                params.append(rt)
+                params.append(self._serialize_token_secret(rt))
 
             if client_id is not None:
                 updates.append("client_id = ?")
@@ -1267,6 +1357,18 @@ class Database:
             if last_egress_binding is not None:
                 updates.append("last_egress_binding = ?")
                 params.append(last_egress_binding)
+
+            if last_egress_status is not None:
+                updates.append("last_egress_status = ?")
+                params.append(last_egress_status)
+
+            if last_egress_probe_at is not None:
+                updates.append("last_egress_probe_at = ?")
+                params.append(last_egress_probe_at)
+
+            if last_egress_probe_details is not None:
+                updates.append("last_egress_probe_details = ?")
+                params.append(last_egress_probe_details)
 
             if last_auth_context_hash is not None:
                 updates.append("last_auth_context_hash = ?")
@@ -1428,9 +1530,10 @@ class Database:
             cursor = await db.execute("""
                 INSERT INTO tasks (
                     task_id, token_id, model, prompt, status, progress,
-                    current_stage, failure_stage, error_code, error_category, last_event_at
+                    current_stage, failure_stage, error_code, error_category,
+                    auth_snapshot_id, polling_context, last_event_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task.task_id,
                 task.token_id,
@@ -1442,21 +1545,45 @@ class Database:
                 task.failure_stage,
                 task.error_code,
                 task.error_category,
+                task.auth_snapshot_id,
+                self._serialize_polling_context(task.polling_context),
                 task.last_event_at,
             ))
             await db.commit()
             return cursor.lastrowid
-    
-    async def update_task(self, task_id: str, status: str, progress: float, 
-                         result_urls: Optional[str] = None, error_message: Optional[str] = None):
+
+    async def update_task(self, task_id: str, status: str, progress: float,
+                         result_urls: Optional[str] = None, error_message: Optional[str] = None,
+                         current_stage: Optional[str] = None):
         """Update task status"""
         async with aiosqlite.connect(self.db_path) as db:
             completed_at = datetime.now() if status in ["completed", "failed"] else None
+            effective_stage = current_stage
+            if status == "completed":
+                effective_stage = "completed"
             await db.execute("""
                 UPDATE tasks 
-                SET status = ?, progress = ?, result_urls = ?, error_message = ?, completed_at = ?
+                SET status = ?, progress = ?, result_urls = ?, error_message = ?, completed_at = ?,
+                    current_stage = COALESCE(?, current_stage),
+                    last_event_at = CURRENT_TIMESTAMP
                 WHERE task_id = ?
-            """, (status, progress, result_urls, error_message, completed_at, task_id))
+            """, (status, progress, result_urls, error_message, completed_at, effective_stage, task_id))
+            await db.commit()
+
+    async def update_task_polling_context(
+        self,
+        task_id: str,
+        polling_context: Optional[str],
+        auth_snapshot_id: Optional[str] = None,
+    ):
+        """Persist task-scoped polling context."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE tasks
+                SET polling_context = ?, auth_snapshot_id = COALESCE(?, auth_snapshot_id),
+                    last_event_at = CURRENT_TIMESTAMP
+                WHERE task_id = ?
+            """, (self._serialize_polling_context(polling_context), auth_snapshot_id, task_id))
             await db.commit()
 
     async def update_task_stage(
@@ -1498,7 +1625,7 @@ class Database:
             cursor = await db.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
             row = await cursor.fetchone()
             if row:
-                return Task(**dict(row))
+                return self._decode_task_row(dict(row))
             return None
     
     # Request log operations
@@ -1561,10 +1688,16 @@ class Database:
             await db.commit()
 
     async def get_recent_logs(self, limit: int = 100) -> List[dict]:
-        """Get recent logs with token email"""
+        """Get recent logs with token email, collapsed to one primary row per task."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
+                WITH primary_task_logs AS (
+                    SELECT task_id, MIN(id) AS primary_log_id
+                    FROM request_logs
+                    WHERE task_id IS NOT NULL
+                    GROUP BY task_id
+                )
                 SELECT
                     rl.id,
                     rl.token_id,
@@ -1578,11 +1711,15 @@ class Database:
                     rl.status_code,
                     rl.duration,
                     rl.created_at,
+                    rl.updated_at,
+                    COALESCE(rl.updated_at, rl.created_at) AS event_at,
                     t.email as token_email,
                     t.username as token_username
                 FROM request_logs rl
                 LEFT JOIN tokens t ON rl.token_id = t.id
-                ORDER BY rl.created_at DESC
+                LEFT JOIN primary_task_logs ptl ON rl.task_id = ptl.task_id
+                WHERE rl.task_id IS NULL OR rl.id = ptl.primary_log_id
+                ORDER BY datetime(COALESCE(rl.updated_at, rl.created_at)) DESC, rl.id DESC
                 LIMIT ?
             """, (limit,))
             rows = await cursor.fetchall()
@@ -1608,6 +1745,9 @@ class Database:
         last_browser_user_agent: Optional[str] = None,
         last_device_id: Optional[str] = None,
         last_egress_binding: Optional[str] = None,
+        last_egress_status: Optional[str] = None,
+        last_egress_probe_at: Optional[datetime] = None,
+        last_egress_probe_details: Optional[str] = None,
         last_auth_context_hash: Optional[str] = None,
         last_auth_context_expires_at: Optional[datetime] = None,
         last_auth_page_url: Optional[str] = None,
@@ -1626,6 +1766,9 @@ class Database:
             last_browser_user_agent=last_browser_user_agent,
             last_device_id=last_device_id,
             last_egress_binding=last_egress_binding,
+            last_egress_status=last_egress_status,
+            last_egress_probe_at=last_egress_probe_at,
+            last_egress_probe_details=last_egress_probe_details,
             last_auth_context_hash=last_auth_context_hash,
             last_auth_context_expires_at=last_auth_context_expires_at,
             last_auth_page_url=last_auth_page_url,

@@ -21,6 +21,7 @@ from .services.concurrency_manager import ConcurrencyManager
 from .services.browser_runtime import BrowserRuntime
 from .services.nst_browser_provider import NSTBrowserProvider
 from .services.mutation_executor import MutationExecutor
+from .services.polling_client import PollingClient
 from .api import routes as api_routes
 from .api import admin as admin_routes
 
@@ -51,9 +52,10 @@ concurrency_manager = ConcurrencyManager()
 load_balancer = LoadBalancer(token_manager, concurrency_manager)
 browser_runtime = BrowserRuntime()
 browser_provider = NSTBrowserProvider() if config.browser_provider == "nst" else None
-mutation_executor = MutationExecutor(db, browser_provider, browser_runtime) if browser_provider else MutationExecutor(db, None, browser_runtime)
+mutation_executor = MutationExecutor(db, browser_provider, browser_runtime, proxy_manager) if browser_provider else MutationExecutor(db, None, browser_runtime, proxy_manager)
 sora_client = SoraClient(proxy_manager, db=db, mutation_executor=mutation_executor)
-generation_handler = GenerationHandler(sora_client, token_manager, load_balancer, db, proxy_manager, concurrency_manager)
+polling_client = PollingClient(db, proxy_manager, mutation_executor)
+generation_handler = GenerationHandler(sora_client, token_manager, load_balancer, db, proxy_manager, concurrency_manager, polling_client=polling_client)
 
 # Set dependencies for route modules
 api_routes.set_generation_handler(generation_handler)
@@ -113,13 +115,13 @@ async def startup_event():
 
     # Handle database initialization based on startup type
     if is_first_startup:
-        print("🎉 First startup detected. Initializing database and configuration from setting.toml...")
+        print("First startup detected. Initializing database and configuration from setting.toml...")
         await db.init_config_from_toml(config_dict, is_first_startup=True)
-        print("✓ Database and configuration initialized successfully.")
+        print("Database and configuration initialized successfully.")
     else:
-        print("🔄 Existing database detected. Checking for missing tables and columns...")
+        print("Existing database detected. Checking for missing tables and columns...")
         await db.check_and_migrate_db(config_dict)
-        print("✓ Database migration check completed.")
+        print("Database migration check completed.")
 
     # Load admin credentials and API key from database
     admin_config = await db.get_admin_config()
@@ -149,7 +151,7 @@ async def startup_event():
     call_logic_config = await db.get_call_logic_config()
     config.set_call_logic_mode(call_logic_config.call_mode)
     config.set_poll_interval(call_logic_config.poll_interval)
-    print(f"✓ Call logic mode: {call_logic_config.call_mode}, poll_interval: {call_logic_config.poll_interval}s")
+    print(f"Call logic mode: {call_logic_config.call_mode}, poll_interval: {call_logic_config.poll_interval}s")
 
     # Load POW service configuration from database
     pow_service_config = await db.get_pow_service_config()
@@ -159,12 +161,14 @@ async def startup_event():
     config.set_pow_service_api_key(pow_service_config.api_key or "")
     config.set_pow_service_proxy_enabled(pow_service_config.proxy_enabled)
     config.set_pow_service_proxy_url(pow_service_config.proxy_url or "")
-    print(f"✓ POW service mode: {pow_service_config.mode}, use_token_for_pow: {pow_service_config.use_token_for_pow}")
+    print(f"POW service mode: {pow_service_config.mode}, use_token_for_pow: {pow_service_config.use_token_for_pow}")
 
     # Initialize concurrency manager with all tokens
     all_tokens = await db.get_all_tokens()
     await concurrency_manager.initialize(all_tokens)
-    print(f"✓ Concurrency manager initialized with {len(all_tokens)} tokens")
+    print(f"Concurrency manager initialized with {len(all_tokens)} tokens")
+    if browser_provider:
+        await mutation_executor.reconcile_browser_bindings()
 
     # Start file cache cleanup task
     await generation_handler.file_cache.start_cleanup_task()
@@ -179,9 +183,9 @@ async def startup_event():
             replace_existing=True
         )
         scheduler.start()
-        print("✓ Token auto-refresh scheduler started (daily at 00:00)")
+        print("Token auto-refresh scheduler started (daily at 00:00)")
     else:
-        print("⊘ Token auto-refresh is disabled")
+        print("Token auto-refresh is disabled")
 
 @app.on_event("shutdown")
 async def shutdown_event():

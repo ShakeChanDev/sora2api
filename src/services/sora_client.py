@@ -18,6 +18,7 @@ from curl_cffi import CurlMime
 from .proxy_manager import ProxyManager
 from .pow_service_client import pow_service_client
 from .mutation_executor import MutationExecutor
+from .browser_provider import MutationResult
 from ..core.config import config
 from ..core.logger import debug_logger
 
@@ -1306,7 +1307,7 @@ class SoraClient:
     
     async def generate_video(self, prompt: str, token: str, orientation: str = "landscape",
                             media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None,
-                            model: str = "sy_8", size: str = "small", token_id: Optional[int] = None) -> str:
+                            model: str = "sy_8", size: str = "small", token_id: Optional[int] = None) -> MutationResult:
         """Generate video (text-to-video or image-to-video)
 
         Args:
@@ -1364,11 +1365,12 @@ class SoraClient:
         """
         if not self.mutation_executor:
             raise RuntimeError("High-risk publish requires a configured mutation executor")
-        return await self.mutation_executor.execute_publish(
+        result = await self.mutation_executor.execute_publish(
             generation_id=generation_id,
             post_text="",
             token_id=token_id,
         )
+        return result.response_data.get("post", {}).get("id", "")
 
     async def delete_post(self, post_id: str, token: str) -> bool:
         """Delete a published post
@@ -1742,7 +1744,7 @@ class SoraClient:
 
     async def remix_video(self, remix_target_id: str, prompt: str, token: str,
                          orientation: str = "portrait", n_frames: int = 450, style_id: Optional[str] = None,
-                         token_id: Optional[int] = None) -> str:
+                         token_id: Optional[int] = None) -> MutationResult:
         """Generate video using remix (based on existing video)
 
         Args:
@@ -1754,7 +1756,7 @@ class SoraClient:
             style_id: Optional style ID
 
         Returns:
-            task_id
+            MutationResult with task-scoped polling context
         """
         if not self.mutation_executor:
             raise RuntimeError("High-risk remix submit requires a configured mutation executor")
@@ -1768,7 +1770,7 @@ class SoraClient:
         )
 
     async def extend_video(self, generation_id: str, prompt: str, extension_duration_s: int,
-                          token: str, token_id: Optional[int] = None) -> str:
+                          token: str, token_id: Optional[int] = None) -> MutationResult:
         """Extend an existing video draft by generation id.
 
         Args:
@@ -1779,16 +1781,10 @@ class SoraClient:
             token_id: Token ID for token-specific proxy (optional)
 
         Returns:
-            task_id
+            MutationResult with task-scoped polling context
         """
         if extension_duration_s not in [10, 15]:
             raise ValueError("extension_duration_s must be 10 or 15")
-
-        json_data = {
-            "user_prompt": prompt,
-            "extension_duration_s": extension_duration_s,
-            "enable_rewrite": True
-        }
 
         if not self.mutation_executor:
             raise RuntimeError("High-risk long video extension requires a configured mutation executor")
@@ -1801,7 +1797,7 @@ class SoraClient:
 
     async def generate_storyboard(self, prompt: str, token: str, orientation: str = "landscape",
                                  media_id: Optional[str] = None, n_frames: int = 450,
-                                 style_id: Optional[str] = None, token_id: Optional[int] = None) -> str:
+                                 style_id: Optional[str] = None, token_id: Optional[int] = None) -> MutationResult:
         """Generate video using storyboard mode
 
         Args:
@@ -1813,7 +1809,7 @@ class SoraClient:
             style_id: Optional style ID
 
         Returns:
-            task_id
+            MutationResult with task-scoped polling context
         """
         if not self.mutation_executor:
             raise RuntimeError("High-risk storyboard submit requires a configured mutation executor")

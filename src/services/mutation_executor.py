@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+from curl_cffi.requests import AsyncSession
 
 from ..core.config import config
 from ..core.logger import debug_logger
@@ -12,13 +15,13 @@ from .browser_provider import (
     BrowserMutationRequest,
     BrowserProvider,
     BrowserProviderError,
+    EgressProbeObservation,
+    MutationResult,
 )
 from .browser_runtime import BrowserRuntime
 
 
 class MutationStrategy:
-    """Supported mutation strategies."""
-
     PAGE_EXECUTE = "page_execute"
     PAGE_REFRESH_THEN_REPLAY = "page_refresh_then_replay"
     REPLAY_WITH_PAGE_FALLBACK = "replay_with_page_fallback"
@@ -26,8 +29,6 @@ class MutationStrategy:
 
 
 class MutationType:
-    """Known mutation types."""
-
     IMAGE_UPLOAD = "image_upload"
     IMAGE_SUBMIT = "image_submit"
     VIDEO_SUBMIT = "video_submit"
@@ -39,8 +40,6 @@ class MutationType:
 
 @dataclass(frozen=True)
 class MutationPolicy:
-    """Execution policy for a mutation type."""
-
     default_strategy: str
     preferred_url: str
     flow: str
@@ -48,44 +47,25 @@ class MutationPolicy:
 
 
 POLICIES: Dict[str, MutationPolicy] = {
-    MutationType.VIDEO_SUBMIT: MutationPolicy(
-        default_strategy=MutationStrategy.PAGE_EXECUTE,
-        preferred_url="https://sora.chatgpt.com/explore",
-        flow="sora_2_create_task",
-    ),
-    MutationType.STORYBOARD_SUBMIT: MutationPolicy(
-        default_strategy=MutationStrategy.PAGE_EXECUTE,
-        preferred_url="https://sora.chatgpt.com/explore",
-        flow="sora_2_create_task",
-    ),
-    MutationType.REMIX_SUBMIT: MutationPolicy(
-        default_strategy=MutationStrategy.PAGE_EXECUTE,
-        preferred_url="https://sora.chatgpt.com/explore",
-        flow="sora_2_create_task",
-    ),
-    MutationType.LONG_VIDEO_EXTENSION: MutationPolicy(
-        default_strategy=MutationStrategy.PAGE_EXECUTE,
-        preferred_url="https://sora.chatgpt.com/drafts",
-        flow="sora_2_create_task",
-    ),
-    MutationType.PUBLISH_EXECUTE: MutationPolicy(
-        default_strategy=MutationStrategy.PAGE_EXECUTE,
-        preferred_url="https://sora.chatgpt.com/drafts",
-        flow="sora_2_create_post",
-    ),
+    MutationType.VIDEO_SUBMIT: MutationPolicy(MutationStrategy.PAGE_EXECUTE, "https://sora.chatgpt.com/explore", "sora_2_create_task"),
+    MutationType.STORYBOARD_SUBMIT: MutationPolicy(MutationStrategy.PAGE_EXECUTE, "https://sora.chatgpt.com/explore", "sora_2_create_task"),
+    MutationType.REMIX_SUBMIT: MutationPolicy(MutationStrategy.PAGE_EXECUTE, "https://sora.chatgpt.com/explore", "sora_2_create_task"),
+    MutationType.LONG_VIDEO_EXTENSION: MutationPolicy(MutationStrategy.PAGE_EXECUTE, "https://sora.chatgpt.com/drafts", "sora_2_create_task"),
+    MutationType.PUBLISH_EXECUTE: MutationPolicy(MutationStrategy.PAGE_EXECUTE, "https://sora.chatgpt.com/drafts", "sora_2_create_post"),
 }
 
-
 RECOVERABLE_BROWSER_CODES = {"TARGET_CLOSED", "ECONNREFUSED", "execution_context_destroyed"}
+REPLAY_ALLOWLIST: set[str] = set()
 
 
 class MutationExecutor:
     """Executes high-risk mutations with page-bound auth refresh and locking."""
 
-    def __init__(self, db, provider: Optional[BrowserProvider], runtime: Optional[BrowserRuntime] = None):
+    def __init__(self, db, provider: Optional[BrowserProvider], runtime: Optional[BrowserRuntime] = None, proxy_manager=None):
         self.db = db
         self.provider = provider
         self.runtime = runtime or BrowserRuntime()
+        self.proxy_manager = proxy_manager
 
     def _get_policy(self, mutation_type: str) -> MutationPolicy:
         policy = POLICIES.get(mutation_type)
@@ -93,21 +73,16 @@ class MutationExecutor:
             raise ValueError(f"Unsupported mutation type: {mutation_type}")
         return policy
 
-    async def _resolve_profile(self, token_id: Optional[int]) -> Tuple[str, str]:
-        if not config.browser_enabled:
-            raise BrowserProviderError("browser_provider_unavailable", "Browser-backed high-risk mutations are disabled in configuration")
-        token_obj = await self.db.get_token(token_id) if token_id else None
-        provider_name = (token_obj.browser_provider if token_obj and token_obj.browser_provider else config.browser_provider).strip() or "nst"
-        profile_id = ""
-        if token_obj and token_obj.browser_profile_id:
-            profile_id = token_obj.browser_profile_id
-        elif config.browser_default_profile_id:
-            profile_id = config.browser_default_profile_id
-        if not profile_id:
-            raise BrowserProviderError("browser_profile_not_configured", "No browser profile bound to token and no default browser profile configured")
-        if not self.provider or provider_name != getattr(self.provider, "provider_name", provider_name):
-            raise BrowserProviderError("browser_provider_unavailable", f"Browser provider '{provider_name}' is not configured")
-        return profile_id, provider_name
+    def _request_log_operation(self, mutation_type: str, index: int) -> str:
+        mapping = {
+            MutationType.VIDEO_SUBMIT: ["generate_video"],
+            MutationType.STORYBOARD_SUBMIT: ["storyboard_submit"],
+            MutationType.REMIX_SUBMIT: ["remix_submit"],
+            MutationType.LONG_VIDEO_EXTENSION: ["long_video_extension"],
+            MutationType.PUBLISH_EXECUTE: ["publish_read_prereq", "publish_execute"],
+        }
+        operations = mapping.get(mutation_type, [mutation_type])
+        return operations[index - 1] if index - 1 < len(operations) else f"{mutation_type}_{index}"
 
     async def _record_task_event(
         self,
@@ -152,16 +127,7 @@ class MutationExecutor:
             error_reason=message,
             details=json.dumps(details, ensure_ascii=False) if details is not None else None,
         )
-        await self._record_task_event(
-            task_id=task_id,
-            token_id=token_id,
-            event_type="error",
-            stage=stage,
-            status="error",
-            message=message,
-            details=details,
-            error_code=error_code,
-        )
+        await self._record_task_event(task_id, token_id, "error", stage, "error", message, details, error_code)
         if task_id:
             await self.db.update_task_stage(
                 task_id=task_id,
@@ -178,6 +144,57 @@ class MutationExecutor:
                 last_challenge_reason=message if error_code == "cloudflare_challenge" else None,
                 account_status="auth_error" if stage == "auth_refresh" else None,
             )
+
+    async def _log_browser_request(
+        self,
+        token_id: Optional[int],
+        task_id: Optional[str],
+        mutation_type: str,
+        index: int,
+        request: BrowserMutationRequest,
+        response_data: Optional[dict],
+        status_code: int,
+        duration: float,
+    ):
+        debug_logger.log_info(
+            "[MutationExecutor] browser request "
+            f"mutation={mutation_type} index={index} task={task_id or '-'} status={status_code} duration={duration:.2f}s"
+        )
+
+    async def _probe_server_egress(self, token_id: Optional[int]) -> Optional[EgressProbeObservation]:
+        if not config.egress_probe_url:
+            return None
+        proxy_url = None
+        if self.proxy_manager:
+            proxy_url = await self.proxy_manager.get_proxy_url(token_id)
+        try:
+            async with AsyncSession(impersonate="chrome") as session:
+                response = await session.get(
+                    config.egress_probe_url,
+                    proxy=proxy_url,
+                    timeout=max(config.egress_probe_timeout_ms / 1000, 1),
+                    headers={"Accept": "application/json", "Cache-Control": "no-store"},
+                )
+            if response.status_code != 200:
+                debug_logger.log_warning(f"[MutationExecutor] Server egress probe failed: {response.status_code}")
+                return None
+            return EgressProbeObservation.from_payload(response.json())
+        except Exception as exc:
+            debug_logger.log_warning(f"[MutationExecutor] Server egress probe error: {exc}")
+            return None
+
+    async def _enrich_egress_binding(self, token_id: Optional[int], auth_context: AuthContext):
+        proxy_policy = None
+        if self.proxy_manager:
+            proxy_policy = await self.proxy_manager.get_proxy_url(token_id)
+        auth_context.egress_binding.proxy_policy = proxy_policy
+        auth_context.egress_binding.server_observation = await self._probe_server_egress(token_id)
+        browser_obs = auth_context.egress_binding.browser_observation
+        server_obs = auth_context.egress_binding.server_observation
+        auth_context.egress_binding.same_network_identity_proven = bool(
+            browser_obs and server_obs and browser_obs.ip and server_obs.ip and browser_obs.asn and server_obs.asn
+            and browser_obs.ip == server_obs.ip and browser_obs.asn == server_obs.asn
+        )
 
     async def _persist_auth_context(self, token_id: Optional[int], auth_context: AuthContext):
         if not token_id:
@@ -196,20 +213,130 @@ class MutationExecutor:
             last_browser_user_agent=auth_context.user_agent,
             last_device_id=auth_context.device_id,
             last_egress_binding=auth_context.egress_binding.binding_key,
+            last_egress_status=auth_context.egress_binding.status,
+            last_egress_probe_at=auth_context.refreshed_at,
+            last_egress_probe_details=json.dumps(auth_context.egress_binding.to_dict(), ensure_ascii=False),
             last_auth_context_hash=auth_context.auth_context_hash,
             last_auth_context_expires_at=auth_context.expires_at,
             last_auth_page_url=auth_context.page_url,
         )
 
     def _failure_stage_for_code(self, error_code: str) -> str:
-        """Map a browser/provider error code to a task stage."""
         if error_code in {"auth_context_incomplete", "auth_context_invalid", "sentinel_not_ready"}:
             return "auth_refresh"
-        if error_code in {"cloudflare_challenge", "browser_context_missing", "browser_profile_not_configured", "browser_provider_unavailable"}:
+        if error_code in {
+            "cloudflare_challenge",
+            "browser_context_missing",
+            "browser_profile_not_configured",
+            "browser_provider_unavailable",
+            "browser_profile_misconfigured",
+            "duplicate_profile_binding",
+        }:
             return "readiness"
-        if error_code in {"TARGET_CLOSED", "ECONNREFUSED", "execution_context_destroyed"}:
+        if error_code in RECOVERABLE_BROWSER_CODES:
             return "reconnect"
         return "mutation_submit"
+
+    async def reconcile_browser_bindings(self):
+        active_tokens = await self.db.get_active_tokens()
+        active_count = len(active_tokens)
+        profile_map: Dict[str, List[int]] = {}
+        for token in active_tokens:
+            if token.browser_profile_id:
+                profile_map.setdefault(token.browser_profile_id, []).append(token.id)
+        duplicate_ids = {token_id for ids in profile_map.values() if len(ids) > 1 for token_id in ids}
+        for token in active_tokens:
+            desired_status = None
+            if token.id in duplicate_ids:
+                desired_status = "duplicate_profile_binding"
+            elif not token.browser_profile_id and config.browser_default_profile_id and config.browser_enforce_token_profile_binding and active_count > 1:
+                desired_status = "misconfigured"
+            elif token.account_status in {"duplicate_profile_binding", "misconfigured"}:
+                desired_status = "ready"
+            if desired_status and token.account_status != desired_status:
+                await self.db.update_token_browser_state(token.id, account_status=desired_status)
+
+    async def _resolve_profile(self, token_id: Optional[int]) -> Tuple[str, str]:
+        if not config.browser_enabled:
+            raise BrowserProviderError("browser_provider_unavailable", "Browser-backed high-risk mutations are disabled in configuration")
+        await self.reconcile_browser_bindings()
+        token_obj = await self.db.get_token(token_id) if token_id else None
+        provider_name = (token_obj.browser_provider if token_obj and token_obj.browser_provider else config.browser_provider).strip() or "nst"
+        if token_obj and token_obj.browser_profile_id:
+            profile_id = token_obj.browser_profile_id
+        elif config.browser_default_profile_id:
+            active_count = await self.db.count_active_tokens()
+            if config.browser_enforce_token_profile_binding and active_count > 1:
+                if token_id:
+                    await self.db.update_token_browser_state(token_id, account_status="misconfigured")
+                raise BrowserProviderError("browser_profile_misconfigured", "Multiple active tokens require explicit browser_profile_id bindings")
+            profile_id = config.browser_default_profile_id
+        else:
+            profile_id = ""
+        if not profile_id:
+            raise BrowserProviderError("browser_profile_not_configured", "No browser profile bound to token and no default browser profile configured")
+        active_tokens = await self.db.get_active_tokens()
+        duplicates = [token.id for token in active_tokens if token.browser_profile_id == profile_id]
+        if len(duplicates) > 1:
+            for duplicate_id in duplicates:
+                await self.db.update_token_browser_state(duplicate_id, account_status="duplicate_profile_binding")
+            raise BrowserProviderError("duplicate_profile_binding", f"Profile {profile_id} is bound to multiple active tokens")
+        if not self.provider or provider_name != getattr(self.provider, "provider_name", provider_name):
+            raise BrowserProviderError("browser_provider_unavailable", f"Browser provider '{provider_name}' is not configured")
+        return profile_id, provider_name
+
+    def assert_replay_allowed(self, mutation_type: str, strategy: str, auth_context: AuthContext):
+        if strategy == MutationStrategy.PAGE_EXECUTE:
+            return
+        policy = self._get_policy(mutation_type)
+        if mutation_type not in REPLAY_ALLOWLIST or not policy.allow_replay:
+            raise BrowserProviderError("replay_not_allowed", f"{mutation_type} is not approved for replay")
+        if not auth_context.egress_binding.same_network_identity_proven:
+            raise BrowserProviderError("network_identity_unproven", "Replay requires proven same-network identity")
+
+    async def refresh_polling_context(
+        self,
+        token_id: Optional[int],
+        preferred_url: Optional[str] = None,
+        task_id: Optional[str] = None,
+        flow: str = "sora_2_create_task",
+    ) -> AuthContext:
+        profile_id, _ = await self._resolve_profile(token_id)
+        preferred_url = preferred_url or "https://sora.chatgpt.com/drafts"
+        recovered = False
+        async with self.runtime.profile_lock(profile_id):
+            while True:
+                connection = None
+                try:
+                    async with self.runtime.startup_queue():
+                        connection = await self.provider.connect_profile(profile_id, preferred_url=preferred_url)
+                    page_context = await self.provider.readiness_check(connection, preferred_url=preferred_url)
+                    window_lock_key = f"{profile_id}:{page_context.page_id or page_context.page_url}"
+                    async with self.runtime.window_lock(window_lock_key):
+                        auth_context = await self.provider.refresh_auth_context(connection, flow, preferred_url=preferred_url)
+                        await self._enrich_egress_binding(token_id, auth_context)
+                        await self._persist_auth_context(token_id, auth_context)
+                        if task_id:
+                            await self._record_task_event(
+                                task_id,
+                                token_id,
+                                "auth_refresh",
+                                "auth_refresh",
+                                "success",
+                                "polling auth context refreshed",
+                                {"profile_id": profile_id, "egress_status": auth_context.egress_binding.status},
+                            )
+                        return auth_context
+                except BrowserProviderError as exc:
+                    if exc.code in RECOVERABLE_BROWSER_CODES and not recovered:
+                        recovered = True
+                        if connection:
+                            await self.provider.disconnect(connection)
+                        continue
+                    raise
+                finally:
+                    if connection:
+                        await self.provider.disconnect(connection)
 
     async def _run_page_plan(
         self,
@@ -218,11 +345,10 @@ class MutationExecutor:
         request_plan: List[BrowserMutationRequest],
         task_id: Optional[str] = None,
         preferred_url: Optional[str] = None,
-    ) -> dict:
+    ) -> MutationResult:
         policy = self._get_policy(mutation_type)
         profile_id, provider_name = await self._resolve_profile(token_id)
         preferred_url = preferred_url or policy.preferred_url
-
         attempt_id = await self.db.create_mutation_attempt(
             token_id=token_id,
             task_id=task_id,
@@ -238,10 +364,8 @@ class MutationExecutor:
             details=json.dumps({"request_count": len(request_plan)}, ensure_ascii=False),
         )
         await self._record_task_event(task_id, token_id, "mutation_attempt", "queued", "started", f"{mutation_type} queued", {"profile_id": profile_id})
-
         last_response = None
         recovered = False
-
         async with self.runtime.profile_lock(profile_id):
             while True:
                 connection = None
@@ -249,28 +373,14 @@ class MutationExecutor:
                     async with self.runtime.startup_queue():
                         await self.db.update_mutation_attempt(attempt_id, stage="startup", status="running")
                         connection = await self.provider.connect_profile(profile_id, preferred_url=preferred_url)
-
                     page_context = await self.provider.readiness_check(connection, preferred_url=preferred_url)
                     window_lock_key = f"{profile_id}:{page_context.page_id or page_context.page_url}"
-
                     async with self.runtime.window_lock(window_lock_key):
-                        await self.db.update_mutation_attempt(
-                            attempt_id,
-                            stage="readiness",
-                            status="running",
-                            window_id=page_context.page_id,
-                            page_url=page_context.page_url,
-                        )
+                        await self.db.update_mutation_attempt(attempt_id, stage="readiness", status="running", window_id=page_context.page_id, page_url=page_context.page_url)
                         await self._record_task_event(task_id, token_id, "readiness", "readiness", "success", "page ready", {"page_url": page_context.page_url})
-
                         auth_context = await self.provider.refresh_auth_context(connection, policy.flow, preferred_url=preferred_url)
-                        await self.db.update_mutation_attempt(
-                            attempt_id,
-                            stage="auth_refresh",
-                            status="running",
-                            egress_binding=auth_context.egress_binding.binding_key,
-                            page_url=auth_context.page_url,
-                        )
+                        await self._enrich_egress_binding(token_id, auth_context)
+                        await self.db.update_mutation_attempt(attempt_id, stage="auth_refresh", status="running", egress_binding=auth_context.egress_binding.binding_key, page_url=auth_context.page_url)
                         await self._persist_auth_context(token_id, auth_context)
                         await self._record_task_event(
                             task_id,
@@ -282,23 +392,16 @@ class MutationExecutor:
                             {
                                 "profile_id": auth_context.profile_id,
                                 "egress_binding": auth_context.egress_binding.binding_key,
+                                "egress_status": auth_context.egress_binding.status,
                                 "same_network_identity_proven": auth_context.egress_binding.same_network_identity_proven,
                             },
                         )
-
                         for index, request in enumerate(request_plan, start=1):
                             await self.db.update_mutation_attempt(attempt_id, stage="mutation_submit", status="running")
+                            request_started_at = time.time()
                             last_response = await self.provider.fetch_json(connection, request, auth_context)
-                            await self._record_task_event(
-                                task_id,
-                                token_id,
-                                "mutation_submit",
-                                "mutation_submit",
-                                "success",
-                                f"{request.method} {request.url} completed",
-                                {"index": index, "status": last_response.status},
-                            )
-
+                            await self._log_browser_request(token_id, task_id, mutation_type, index, request, last_response.data, last_response.status, time.time() - request_started_at)
+                            await self._record_task_event(task_id, token_id, "mutation_submit", "mutation_submit", "success", f"{request.method} {request.url} completed", {"index": index, "status": last_response.status})
                         response_data = last_response.data or {}
                         derived_task_id = response_data.get("id") or task_id
                         await self.db.update_mutation_attempt(
@@ -306,26 +409,28 @@ class MutationExecutor:
                             task_id=derived_task_id,
                             stage="completed",
                             status="succeeded",
-                            details=json.dumps({"status": last_response.status}, ensure_ascii=False),
+                            details=json.dumps({"status": last_response.status, "request_count": len(request_plan)}, ensure_ascii=False),
                         )
-                        return response_data
-
+                        return MutationResult(
+                            task_id=derived_task_id,
+                            polling_context=auth_context.to_polling_context(),
+                            auth_snapshot_id=auth_context.auth_context_hash,
+                            response_data=response_data,
+                        )
                 except BrowserProviderError as exc:
                     error_details = {"mutation_type": mutation_type, "profile_id": profile_id, "recovered": recovered}
-                    if attempt_id:
-                        await self.db.update_mutation_attempt(
-                            attempt_id,
-                            stage="failed",
-                            status="failed",
-                            error_code=exc.code,
-                            error_reason=str(exc),
-                            details=json.dumps(error_details, ensure_ascii=False),
-                        )
+                    await self.db.update_mutation_attempt(
+                        attempt_id,
+                        stage="failed",
+                        status="failed",
+                        error_code=exc.code,
+                        error_reason=str(exc),
+                        details=json.dumps(error_details, ensure_ascii=False),
+                    )
                     await self._record_failure(task_id, token_id, mutation_type, self._failure_stage_for_code(exc.code), exc.code, str(exc), error_details)
                     if exc.code in RECOVERABLE_BROWSER_CODES and not recovered:
                         recovered = True
                         await self._record_task_event(task_id, token_id, "reconnect", "reconnect", "running", f"Recovering browser profile after {exc.code}", {"profile_id": profile_id})
-                        debug_logger.log_warning(f"[MutationExecutor] Recovering profile {profile_id} after {exc.code}: {exc}")
                         if connection:
                             await self.provider.disconnect(connection)
                         continue
@@ -334,214 +439,129 @@ class MutationExecutor:
                     if connection:
                         await self.provider.disconnect(connection)
 
-    async def execute_video_submit(
-        self,
-        prompt: str,
-        token_id: Optional[int],
-        orientation: str,
-        n_frames: int,
-        model: str,
-        size: str,
-        media_id: Optional[str] = None,
-        style_id: Optional[str] = None,
-    ) -> str:
-        inpaint_items = []
-        if media_id:
-            inpaint_items = [{"kind": "upload", "upload_id": media_id}]
-        json_body = {
-            "kind": "video",
-            "prompt": prompt,
-            "title": None,
-            "orientation": orientation,
-            "size": size,
-            "n_frames": n_frames,
-            "inpaint_items": inpaint_items,
-            "remix_target_id": None,
-            "reroll_target_id": None,
-            "project_config": None,
-            "trim_config": None,
-            "metadata": None,
-            "cameo_ids": None,
-            "cameo_replacements": None,
-            "model": model,
-            "style_id": style_id,
-            "audio_caption": None,
-            "audio_transcript": None,
-            "video_caption": None,
-            "storyboard_id": None,
-        }
-        response = await self._run_page_plan(
+    async def execute_video_submit(self, prompt: str, token_id: Optional[int], orientation: str, n_frames: int, model: str, size: str, media_id: Optional[str] = None, style_id: Optional[str] = None) -> MutationResult:
+        inpaint_items = [{"kind": "upload", "upload_id": media_id}] if media_id else []
+        result = await self._run_page_plan(
             mutation_type=MutationType.VIDEO_SUBMIT,
             token_id=token_id,
-            request_plan=[
-                BrowserMutationRequest(
-                    method="POST",
-                    url="https://sora.chatgpt.com/backend/nf/create",
-                    json_body=json_body,
-                    expected_status=200,
-                )
-            ],
+            request_plan=[BrowserMutationRequest("POST", "https://sora.chatgpt.com/backend/nf/create", {
+                "kind": "video",
+                "prompt": prompt,
+                "title": None,
+                "orientation": orientation,
+                "size": size,
+                "n_frames": n_frames,
+                "inpaint_items": inpaint_items,
+                "remix_target_id": None,
+                "reroll_target_id": None,
+                "project_config": None,
+                "trim_config": None,
+                "metadata": None,
+                "cameo_ids": None,
+                "cameo_replacements": None,
+                "model": model,
+                "style_id": style_id,
+                "audio_caption": None,
+                "audio_transcript": None,
+                "video_caption": None,
+                "storyboard_id": None,
+            }, expected_status=200)],
         )
-        task_id = response.get("id")
-        if not task_id:
+        if not result.task_id:
             raise BrowserProviderError("page_execute_failed", "Video submit completed without task id")
-        return task_id
+        return result
 
-    async def execute_storyboard_submit(
-        self,
-        prompt: str,
-        token_id: Optional[int],
-        orientation: str,
-        media_id: Optional[str],
-        n_frames: int,
-        style_id: Optional[str],
-    ) -> str:
+    async def execute_storyboard_submit(self, prompt: str, token_id: Optional[int], orientation: str, media_id: Optional[str], n_frames: int, style_id: Optional[str]) -> MutationResult:
         inpaint_items = [{"kind": "upload", "upload_id": media_id}] if media_id else []
-        json_body = {
-            "kind": "video",
-            "prompt": prompt,
-            "title": "Draft your video",
-            "orientation": orientation,
-            "size": "small",
-            "n_frames": n_frames,
-            "storyboard_id": None,
-            "inpaint_items": inpaint_items,
-            "remix_target_id": None,
-            "reroll_target_id": None,
-            "project_config": None,
-            "trim_config": None,
-            "model": "sy_8",
-            "metadata": None,
-            "style_id": style_id,
-            "cameo_ids": None,
-            "cameo_replacements": None,
-            "audio_caption": None,
-            "audio_transcript": None,
-            "video_caption": None,
-        }
-        response = await self._run_page_plan(
+        result = await self._run_page_plan(
             mutation_type=MutationType.STORYBOARD_SUBMIT,
             token_id=token_id,
-            request_plan=[
-                BrowserMutationRequest(
-                    method="POST",
-                    url="https://sora.chatgpt.com/backend/nf/create/storyboard",
-                    json_body=json_body,
-                    expected_status=200,
-                )
-            ],
+            request_plan=[BrowserMutationRequest("POST", "https://sora.chatgpt.com/backend/nf/create/storyboard", {
+                "kind": "video",
+                "prompt": prompt,
+                "title": "Draft your video",
+                "orientation": orientation,
+                "size": "small",
+                "n_frames": n_frames,
+                "storyboard_id": None,
+                "inpaint_items": inpaint_items,
+                "remix_target_id": None,
+                "reroll_target_id": None,
+                "project_config": None,
+                "trim_config": None,
+                "model": "sy_8",
+                "metadata": None,
+                "style_id": style_id,
+                "cameo_ids": None,
+                "cameo_replacements": None,
+                "audio_caption": None,
+                "audio_transcript": None,
+                "video_caption": None,
+            }, expected_status=200)],
         )
-        task_id = response.get("id")
-        if not task_id:
+        if not result.task_id:
             raise BrowserProviderError("page_execute_failed", "Storyboard submit completed without task id")
-        return task_id
+        return result
 
-    async def execute_remix_submit(
-        self,
-        remix_target_id: str,
-        prompt: str,
-        token_id: Optional[int],
-        orientation: str,
-        n_frames: int,
-        style_id: Optional[str],
-    ) -> str:
-        json_body = {
-            "kind": "video",
-            "prompt": prompt,
-            "title": None,
-            "orientation": orientation,
-            "size": "small",
-            "n_frames": n_frames,
-            "inpaint_items": [],
-            "remix_target_id": remix_target_id,
-            "reroll_target_id": None,
-            "project_config": None,
-            "trim_config": None,
-            "metadata": None,
-            "cameo_ids": None,
-            "cameo_replacements": None,
-            "model": "sy_8",
-            "style_id": style_id,
-            "audio_caption": None,
-            "audio_transcript": None,
-            "video_caption": None,
-            "storyboard_id": None,
-        }
-        response = await self._run_page_plan(
+    async def execute_remix_submit(self, remix_target_id: str, prompt: str, token_id: Optional[int], orientation: str, n_frames: int, style_id: Optional[str]) -> MutationResult:
+        result = await self._run_page_plan(
             mutation_type=MutationType.REMIX_SUBMIT,
             token_id=token_id,
-            request_plan=[
-                BrowserMutationRequest(
-                    method="POST",
-                    url="https://sora.chatgpt.com/backend/nf/create",
-                    json_body=json_body,
-                    expected_status=200,
-                )
-            ],
+            request_plan=[BrowserMutationRequest("POST", "https://sora.chatgpt.com/backend/nf/create", {
+                "kind": "video",
+                "prompt": prompt,
+                "title": None,
+                "orientation": orientation,
+                "size": "small",
+                "n_frames": n_frames,
+                "inpaint_items": [],
+                "remix_target_id": remix_target_id,
+                "reroll_target_id": None,
+                "project_config": None,
+                "trim_config": None,
+                "metadata": None,
+                "cameo_ids": None,
+                "cameo_replacements": None,
+                "model": "sy_8",
+                "style_id": style_id,
+                "audio_caption": None,
+                "audio_transcript": None,
+                "video_caption": None,
+                "storyboard_id": None,
+            }, expected_status=200)],
         )
-        task_id = response.get("id")
-        if not task_id:
+        if not result.task_id:
             raise BrowserProviderError("page_execute_failed", "Remix submit completed without task id")
-        return task_id
+        return result
 
-    async def execute_long_video_extension(
-        self,
-        generation_id: str,
-        prompt: str,
-        extension_duration_s: int,
-        token_id: Optional[int],
-    ) -> str:
-        response = await self._run_page_plan(
+    async def execute_long_video_extension(self, generation_id: str, prompt: str, extension_duration_s: int, token_id: Optional[int]) -> MutationResult:
+        result = await self._run_page_plan(
             mutation_type=MutationType.LONG_VIDEO_EXTENSION,
             token_id=token_id,
             preferred_url=f"https://sora.chatgpt.com/d/{generation_id}",
-            request_plan=[
-                BrowserMutationRequest(
-                    method="POST",
-                    url=f"https://sora.chatgpt.com/backend/project_y/profile/drafts/{generation_id}/long_video_extension",
-                    json_body={
-                        "user_prompt": prompt,
-                        "extension_duration_s": extension_duration_s,
-                        "enable_rewrite": True,
-                    },
-                    expected_status=200,
-                )
-            ],
+            request_plan=[BrowserMutationRequest("POST", f"https://sora.chatgpt.com/backend/project_y/profile/drafts/{generation_id}/long_video_extension", {
+                "user_prompt": prompt,
+                "extension_duration_s": extension_duration_s,
+                "enable_rewrite": True,
+            }, expected_status=200)],
         )
-        task_id = response.get("id")
-        if not task_id:
+        if not result.task_id:
             raise BrowserProviderError("page_execute_failed", "Long video extension completed without task id")
-        return task_id
+        return result
 
-    async def execute_publish(
-        self,
-        generation_id: str,
-        post_text: str,
-        token_id: Optional[int],
-    ) -> str:
-        response = await self._run_page_plan(
+    async def execute_publish(self, generation_id: str, post_text: str, token_id: Optional[int]) -> MutationResult:
+        result = await self._run_page_plan(
             mutation_type=MutationType.PUBLISH_EXECUTE,
             token_id=token_id,
             preferred_url=f"https://sora.chatgpt.com/d/{generation_id}",
             request_plan=[
-                BrowserMutationRequest(
-                    method="POST",
-                    url=f"https://sora.chatgpt.com/backend/project_y/profile/drafts/{generation_id}/read",
-                    json_body={},
-                    expected_status=200,
-                ),
-                BrowserMutationRequest(
-                    method="POST",
-                    url="https://sora.chatgpt.com/backend/project_y/post",
-                    json_body={
-                        "attachments_to_create": [{"generation_id": generation_id, "kind": "sora"}],
-                        "post_text": post_text,
-                    },
-                    expected_status=200,
-                ),
+                BrowserMutationRequest("POST", f"https://sora.chatgpt.com/backend/project_y/profile/drafts/{generation_id}/read", {}, expected_status=200),
+                BrowserMutationRequest("POST", "https://sora.chatgpt.com/backend/project_y/post", {
+                    "attachments_to_create": [{"generation_id": generation_id, "kind": "sora"}],
+                    "post_text": post_text,
+                }, expected_status=200),
             ],
         )
-        post_id = response.get("post", {}).get("id", "")
-        if not post_id:
+        if not result.response_data.get("post", {}).get("id", ""):
             raise BrowserProviderError("page_execute_failed", "Publish completed without post id")
-        return post_id
+        return result
