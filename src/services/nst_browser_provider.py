@@ -62,24 +62,50 @@ class NSTBrowserProvider(BrowserProvider):
             raise BrowserProviderError("browser_provider_api_error", payload.get("msg") or f"{method} {path} failed")
         return payload.get("data") or {}
 
-    async def start(self, profile_id: str) -> Dict[str, Any]:
+    async def _request_debugger(self, profile_id: str) -> Optional[Dict[str, Any]]:
         try:
-            return await self._request("POST", f"/browsers/{profile_id}/start")
-        except BrowserProviderError:
             debugger = await self._request("GET", f"/browsers/{profile_id}/debugger")
-            if debugger.get("webSocketDebuggerUrl"):
-                return debugger
-            raise
+        except BrowserProviderError:
+            return None
+        return debugger if debugger.get("webSocketDebuggerUrl") else None
+
+    async def start(self, profile_id: str) -> Dict[str, Any]:
+        debugger = await self._request_debugger(profile_id)
+        if debugger:
+            return debugger
+
+        last_error: Optional[BrowserProviderError] = None
+        for path in (f"/browsers/{profile_id}", f"/browsers/{profile_id}/start"):
+            try:
+                result = await self._request("POST", path)
+                if result.get("webSocketDebuggerUrl"):
+                    return result
+                debugger = await self._request_debugger(profile_id)
+                if debugger:
+                    return debugger
+                return result
+            except BrowserProviderError as exc:
+                last_error = exc
+
+        debugger = await self._request_debugger(profile_id)
+        if debugger:
+            return debugger
+        if last_error:
+            raise last_error
+        raise BrowserProviderError("browser_provider_http_error", f"Failed to start NSTBrowser profile {profile_id}")
 
     async def stop(self, profile_id: str) -> Dict[str, Any]:
         return await self._request("POST", f"/browsers/{profile_id}/stop")
 
     async def _resolve_debugger(self, profile_id: str) -> Dict[str, Any]:
-        try:
-            return await self._request("GET", f"/browsers/{profile_id}/debugger")
-        except BrowserProviderError:
-            await self.start(profile_id)
-            return await self._request("GET", f"/browsers/{profile_id}/debugger")
+        debugger = await self._request_debugger(profile_id)
+        if debugger:
+            return debugger
+        await self.start(profile_id)
+        debugger = await self._request_debugger(profile_id)
+        if debugger:
+            return debugger
+        raise BrowserProviderError("browser_debugger_missing", f"NSTBrowser profile {profile_id} has no debugger endpoint")
 
     async def _resolve_page(self, connection: BrowserConnection, preferred_url: Optional[str]) -> BrowserConnection:
         page = None

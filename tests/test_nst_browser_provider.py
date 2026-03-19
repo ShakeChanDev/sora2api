@@ -1,0 +1,72 @@
+"""Tests for NST browser provider start path selection."""
+import asyncio
+import unittest
+
+from src.services.browser_provider import BrowserProviderError
+from src.services.nst_browser_provider import NSTBrowserProvider
+
+
+class _FakeNSTBrowserProvider(NSTBrowserProvider):
+    def __init__(self, responses):
+        super().__init__(base_url="http://127.0.0.1:8848/api/v2", api_key="")
+        self.responses = list(responses)
+        self.calls = []
+
+    async def _request(self, method, path, json_data=None):
+        self.calls.append((method, path))
+        if not self.responses:
+            raise AssertionError(f"unexpected request: {(method, path)}")
+        expected_method, expected_path, result = self.responses.pop(0)
+        if (method, path) != (expected_method, expected_path):
+            raise AssertionError(f"expected {(expected_method, expected_path)} got {(method, path)}")
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class NSTBrowserProviderTests(unittest.TestCase):
+    def test_start_prefers_plain_browsers_endpoint(self):
+        async def scenario():
+            provider = _FakeNSTBrowserProvider([
+                ("GET", "/browsers/profile-1/debugger", BrowserProviderError("browser_provider_http_error", "not running")),
+                ("POST", "/browsers/profile-1", {"profileId": "profile-1"}),
+                ("GET", "/browsers/profile-1/debugger", {"webSocketDebuggerUrl": "ws://debugger"}),
+            ])
+            result = await provider.start("profile-1")
+            self.assertEqual(result["webSocketDebuggerUrl"], "ws://debugger")
+            self.assertEqual(
+                provider.calls,
+                [
+                    ("GET", "/browsers/profile-1/debugger"),
+                    ("POST", "/browsers/profile-1"),
+                    ("GET", "/browsers/profile-1/debugger"),
+                ],
+            )
+
+        asyncio.run(scenario())
+
+    def test_start_falls_back_to_legacy_start_endpoint(self):
+        async def scenario():
+            provider = _FakeNSTBrowserProvider([
+                ("GET", "/browsers/profile-2/debugger", BrowserProviderError("browser_provider_http_error", "not running")),
+                ("POST", "/browsers/profile-2", BrowserProviderError("browser_provider_http_error", "404")),
+                ("POST", "/browsers/profile-2/start", {"profileId": "profile-2"}),
+                ("GET", "/browsers/profile-2/debugger", {"webSocketDebuggerUrl": "ws://legacy"}),
+            ])
+            result = await provider.start("profile-2")
+            self.assertEqual(result["webSocketDebuggerUrl"], "ws://legacy")
+            self.assertEqual(
+                provider.calls,
+                [
+                    ("GET", "/browsers/profile-2/debugger"),
+                    ("POST", "/browsers/profile-2"),
+                    ("POST", "/browsers/profile-2/start"),
+                    ("GET", "/browsers/profile-2/debugger"),
+                ],
+            )
+
+        asyncio.run(scenario())
+
+
+if __name__ == "__main__":
+    unittest.main()
