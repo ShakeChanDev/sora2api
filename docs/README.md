@@ -4,6 +4,11 @@
 
 - [NSTBrowser 官方 API 与自动化文档整理](./nstbrowser-api-automation.md)
 
+## 研究文档
+
+- [2026-03-20 视频真实轮询观测与 PollingClient 差异](./research/sora-video-polling-observation-2026-03-20.md)
+  - 当前实现已按该文档结论切到 `drafts/v2`，并改为依赖 `browser_profile_id + token.proxy_url` 绑定约束
+
 ## 导入文档
 
 - [api-docs 导入说明](./imported/api-docs/README.md)

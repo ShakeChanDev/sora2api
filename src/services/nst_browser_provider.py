@@ -23,7 +23,6 @@ from .browser_provider import (
     BrowserProviderError,
     BrowserReadinessError,
     EgressBinding,
-    EgressProbeObservation,
 )
 
 
@@ -243,37 +242,6 @@ class NSTBrowserProvider(BrowserProvider):
                 ordered.append(f"{name}={value}")
         return "; ".join(ordered)
 
-    async def _probe_page_egress(self, page) -> Optional[EgressProbeObservation]:
-        if not config.egress_probe_url:
-            return None
-        script = """
-        async (probeUrl) => {
-            const response = await fetch(probeUrl, {
-                method: 'GET',
-                credentials: 'omit',
-                cache: 'no-store',
-                headers: { 'Accept': 'application/json', 'Cache-Control': 'no-store' },
-            });
-            const text = await response.text();
-            let payload = null;
-            try {
-                payload = JSON.parse(text);
-            } catch (error) {
-                payload = null;
-            }
-            return { status: response.status, payload, text };
-        }
-        """
-        try:
-            result = await page.evaluate(script, config.egress_probe_url)
-        except PlaywrightError as exc:
-            debug_logger.log_warning(f"[NSTBrowser] Page egress probe failed: {exc}")
-            return None
-        if result.get("status") != 200 or not isinstance(result.get("payload"), dict):
-            debug_logger.log_warning(f"[NSTBrowser] Page egress probe returned {result.get('status')}")
-            return None
-        return EgressProbeObservation.from_payload(result.get("payload"))
-
     async def refresh_auth_context(
         self,
         connection: BrowserConnection,
@@ -340,6 +308,19 @@ class NSTBrowserProvider(BrowserProvider):
                 userAgent: navigator.userAgent,
                 pageUrl: location.href,
                 sentinelToken,
+                referer: location.href,
+                secFetchSite: 'same-origin',
+                secFetchMode: 'cors',
+                secFetchDest: 'empty',
+                secChUa: navigator.userAgentData && Array.isArray(navigator.userAgentData.brands)
+                    ? navigator.userAgentData.brands.map((brand) => `"${brand.brand}";v="${brand.version}"`).join(', ')
+                    : null,
+                secChUaMobile: navigator.userAgentData
+                    ? (navigator.userAgentData.mobile ? '?1' : '?0')
+                    : null,
+                secChUaPlatform: navigator.userAgentData && navigator.userAgentData.platform
+                    ? `"${navigator.userAgentData.platform}"`
+                    : null,
             };
         }
         """
@@ -385,14 +366,11 @@ class NSTBrowserProvider(BrowserProvider):
                     device_id = cookie.get("value")
                     break
 
-        browser_probe = await self._probe_page_egress(page)
-
         egress_binding = EgressBinding(
             provider=self.provider_name,
             profile_id=connection.profile_id,
             proxy_url=connection.proxy_url,
             page_url=result.get("pageUrl") or connection.page.url,
-            browser_observation=browser_probe,
             same_network_identity_proven=False,
         )
 
@@ -409,6 +387,13 @@ class NSTBrowserProvider(BrowserProvider):
             egress_binding=egress_binding,
             expires_at=expires_at,
             session_payload=result["payload"],
+            referer=result.get("referer") or result.get("pageUrl") or connection.page.url,
+            sec_fetch_site=result.get("secFetchSite"),
+            sec_fetch_mode=result.get("secFetchMode"),
+            sec_fetch_dest=result.get("secFetchDest"),
+            sec_ch_ua=result.get("secChUa"),
+            sec_ch_ua_mobile=result.get("secChUaMobile"),
+            sec_ch_ua_platform=result.get("secChUaPlatform"),
         )
 
     async def fetch_json(

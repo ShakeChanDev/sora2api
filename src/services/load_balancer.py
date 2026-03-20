@@ -91,6 +91,14 @@ class LoadBalancer:
                 if token and token.sora2_cooldown_until and token.sora2_cooldown_until > datetime.now():
                     continue
 
+                provider_name = (token.browser_provider if token.browser_provider else config.browser_provider).strip() or "nst"
+                if provider_name != "nst":
+                    continue
+                if not token.browser_profile_id:
+                    continue
+                if not token.proxy_url:
+                    continue
+
                 if token:
                     available_tokens.append(token)
 

@@ -59,7 +59,3 @@ enforce_token_profile_binding = true
 [nst_browser]
 base_url = "http://127.0.0.1:8848/api/v2"
 api_key = ""
-
-[egress_probe]
-url = ""
-timeout_ms = 8000

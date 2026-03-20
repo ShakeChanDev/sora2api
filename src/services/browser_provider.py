@@ -136,6 +136,13 @@ class AuthContext:
     egress_binding: EgressBinding
     expires_at: Optional[datetime] = None
     session_payload: Dict[str, Any] = field(default_factory=dict)
+    referer: Optional[str] = None
+    sec_fetch_site: Optional[str] = None
+    sec_fetch_mode: Optional[str] = None
+    sec_fetch_dest: Optional[str] = None
+    sec_ch_ua: Optional[str] = None
+    sec_ch_ua_mobile: Optional[str] = None
+    sec_ch_ua_platform: Optional[str] = None
 
     @property
     def cookie_jar_hash(self) -> Optional[str]:
@@ -164,6 +171,14 @@ class AuthContext:
             user_agent=self.user_agent,
             device_id=self.device_id,
             profile_id=self.profile_id,
+            page_url=self.page_url,
+            referer=self.referer or self.page_url,
+            sec_fetch_site=self.sec_fetch_site,
+            sec_fetch_mode=self.sec_fetch_mode,
+            sec_fetch_dest=self.sec_fetch_dest,
+            sec_ch_ua=self.sec_ch_ua,
+            sec_ch_ua_mobile=self.sec_ch_ua_mobile,
+            sec_ch_ua_platform=self.sec_ch_ua_platform,
             egress_binding=self.egress_binding,
             expires_at=self.expires_at,
             refreshed_at=self.refreshed_at,
@@ -180,6 +195,14 @@ class PollingContext:
     device_id: Optional[str]
     profile_id: str
     egress_binding: EgressBinding
+    page_url: Optional[str] = None
+    referer: Optional[str] = None
+    sec_fetch_site: Optional[str] = None
+    sec_fetch_mode: Optional[str] = None
+    sec_fetch_dest: Optional[str] = None
+    sec_ch_ua: Optional[str] = None
+    sec_ch_ua_mobile: Optional[str] = None
+    sec_ch_ua_platform: Optional[str] = None
     expires_at: Optional[datetime] = None
     refreshed_at: Optional[datetime] = None
 
@@ -190,6 +213,14 @@ class PollingContext:
             "user_agent": self.user_agent,
             "device_id": self.device_id,
             "profile_id": self.profile_id,
+            "page_url": self.page_url,
+            "referer": self.referer,
+            "sec_fetch_site": self.sec_fetch_site,
+            "sec_fetch_mode": self.sec_fetch_mode,
+            "sec_fetch_dest": self.sec_fetch_dest,
+            "sec_ch_ua": self.sec_ch_ua,
+            "sec_ch_ua_mobile": self.sec_ch_ua_mobile,
+            "sec_ch_ua_platform": self.sec_ch_ua_platform,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
             "refreshed_at": self.refreshed_at.isoformat() if self.refreshed_at else None,
             "egress_binding": self.egress_binding.to_dict(),
@@ -208,6 +239,14 @@ class PollingContext:
             user_agent=payload.get("user_agent") or "",
             device_id=payload.get("device_id"),
             profile_id=payload.get("profile_id") or "",
+            page_url=payload.get("page_url") or binding_payload.get("page_url"),
+            referer=payload.get("referer") or payload.get("page_url") or binding_payload.get("page_url"),
+            sec_fetch_site=payload.get("sec_fetch_site"),
+            sec_fetch_mode=payload.get("sec_fetch_mode"),
+            sec_fetch_dest=payload.get("sec_fetch_dest"),
+            sec_ch_ua=payload.get("sec_ch_ua"),
+            sec_ch_ua_mobile=payload.get("sec_ch_ua_mobile"),
+            sec_ch_ua_platform=payload.get("sec_ch_ua_platform"),
             expires_at=datetime.fromisoformat(expires_at) if expires_at else None,
             refreshed_at=datetime.fromisoformat(refreshed_at) if refreshed_at else None,
             egress_binding=EgressBinding(

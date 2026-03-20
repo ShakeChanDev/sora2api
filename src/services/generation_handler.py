@@ -248,6 +248,59 @@ class GenerationHandler:
             proxy_manager=proxy_manager
         )
 
+    async def _get_video_binding_issue(self, require_pro: bool = False) -> Optional[tuple[str, str]]:
+        active_tokens = await self.token_manager.get_active_tokens()
+        if require_pro:
+            active_tokens = [token for token in active_tokens if token.plan_type == "chatgpt_pro"]
+        if not active_tokens:
+            return None
+
+        available_tokens = []
+        for token in active_tokens:
+            if not token.video_enabled:
+                continue
+            if not token.sora2_supported:
+                continue
+            if token.sora2_cooldown_until and token.sora2_cooldown_until > datetime.now():
+                continue
+            if self.concurrency_manager and not await self.concurrency_manager.can_use_video(token.id):
+                continue
+            available_tokens.append(token)
+
+        if not available_tokens:
+            return None
+
+        invalid_profile = [
+            token
+            for token in available_tokens
+            if ((token.browser_provider if token.browser_provider else config.browser_provider).strip() or "nst") != "nst"
+            or not token.browser_profile_id
+        ]
+        if invalid_profile:
+            return (
+                "browser_profile_binding_required",
+                "Video tokens require explicit NST browser_profile_id binding",
+            )
+
+        invalid_proxy = [token for token in available_tokens if not token.proxy_url]
+        if invalid_proxy:
+            return (
+                "browser_proxy_binding_required",
+                "Video tokens require proxy_url synchronized from the browser profile",
+            )
+
+        return None
+
+    async def _select_video_token_or_raise(self, no_token_message: str, require_pro: bool = False):
+        token_obj = await self.load_balancer.select_token(for_video_generation=True, require_pro=require_pro)
+        if token_obj:
+            return token_obj
+        binding_issue = await self._get_video_binding_issue(require_pro=require_pro)
+        if binding_issue:
+            error_code, message = binding_issue
+            raise GenerationError(f"{error_code}: {message}")
+        raise Exception(no_token_message)
+
     def _get_base_url(self) -> str:
         """Get base URL for cache files"""
         # Use configured cache base URL if available
@@ -292,6 +345,24 @@ class GenerationHandler:
         if "avatar-create" in error_str:
             return False
         if "参数错误" in error_str:
+            return False
+        if "browser_provider_unavailable" in error_str:
+            return False
+        if "browser_profile_binding_required" in error_str:
+            return False
+        if "browser_proxy_binding_required" in error_str:
+            return False
+        if "polling_context_missing" in error_str:
+            return False
+        if "polling_auth_refresh_failed" in error_str:
+            return False
+        if "polling_pending_unauthorized" in error_str:
+            return False
+        if "polling_drafts_unauthorized" in error_str:
+            return False
+        if "polling_drafts_not_found" in error_str:
+            return False
+        if "polling_drafts_schema_invalid" in error_str:
             return False
 
         # 其他所有错误都可以重试
@@ -554,18 +625,21 @@ class GenerationHandler:
 
         # Select token (with lock for image generation, Sora2 quota check for video generation)
         # If Pro is required, filter for Pro tokens only
-        token_obj = await self.load_balancer.select_token(
-            for_image_generation=is_image,
-            for_video_generation=is_video,
-            require_pro=require_pro
-        )
-        if not token_obj:
-            if require_pro:
-                raise Exception("No available Pro tokens. Pro models require a ChatGPT Pro subscription.")
-            elif is_image:
+        if is_video:
+            no_token_message = (
+                "No available Pro tokens. Pro models require a ChatGPT Pro subscription."
+                if require_pro
+                else "No available tokens for video generation. All tokens are either disabled, cooling down, Sora2 quota exhausted, don't support Sora2, missing browser binding, or expired."
+            )
+            token_obj = await self._select_video_token_or_raise(no_token_message, require_pro=require_pro)
+        else:
+            token_obj = await self.load_balancer.select_token(
+                for_image_generation=is_image,
+                for_video_generation=False,
+                require_pro=require_pro
+            )
+            if not token_obj:
                 raise Exception("No available tokens for image generation. All tokens are either disabled, cooling down, locked, or expired.")
-            else:
-                raise Exception("No available tokens for video generation. All tokens are either disabled, cooling down, Sora2 quota exhausted, don't support Sora2, or expired.")
 
         # Acquire lock for image generation
         if is_image:
@@ -701,7 +775,7 @@ class GenerationHandler:
                 prompt=prompt,
                 status="processing",
                 progress=0.0,
-                current_stage="polling",
+                current_stage="mutation_submit" if is_video else "polling",
                 auth_snapshot_id=submission.auth_snapshot_id if submission else None,
                 polling_context=self._serialize_polling_context(submission),
             )
@@ -960,7 +1034,7 @@ class GenerationHandler:
         """Poll for task result with timeout"""
         # Get timeout from config
         timeout = config.video_timeout if is_video else config.image_timeout
-        poll_interval = config.poll_interval
+        poll_interval = min(max(config.poll_interval, 2.0), 3.0) if is_video else config.poll_interval
         max_attempts = int(timeout / poll_interval)  # Calculate max attempts based on timeout
         last_progress = 0
         start_time = time.time()
@@ -968,6 +1042,7 @@ class GenerationHandler:
         heartbeat_interval = 10  # Send heartbeat every 10 seconds for image generation
         last_status_output_time = start_time  # Track last status output time for video generation
         video_status_interval = 30  # Output status every 30 seconds for video generation
+        last_pending_status = None
 
         debug_logger.log_info(f"Starting task polling: task_id={task_id}, is_video={is_video}, timeout={timeout}s, max_attempts={max_attempts}")
 
@@ -975,6 +1050,19 @@ class GenerationHandler:
         if is_video:
             watermark_free_config = await self.db.get_watermark_free_config()
             debug_logger.log_info(f"Watermark-free mode: {'ENABLED' if watermark_free_config.watermark_free_enabled else 'DISABLED'}")
+            await self._record_task_event(
+                task_id,
+                token_id,
+                "polling_started",
+                "polling",
+                "running",
+                "video polling started",
+                {
+                    "poll_interval_seconds": poll_interval,
+                    "drafts_api_version": "v2",
+                    "has_polling_context": bool(polling_context),
+                },
+            )
 
         for attempt in range(max_attempts):
             # Check if timeout exceeded
@@ -1019,25 +1107,26 @@ class GenerationHandler:
 
             try:
                 if is_video:
-                    if self.polling_client and polling_context is None:
+                    if not self.polling_client:
+                        raise PollingClientError("polling_request_failed", "Video polling client is unavailable")
+                    if polling_context is None:
                         polling_context = await self.polling_client.load_task_polling_context(task_id)
+                    if polling_context is None:
+                        raise PollingClientError("polling_context_missing", "Video task is missing a task-scoped polling context")
 
                     # Get pending tasks to check progress
                     await self.db.update_task_stage(task_id, current_stage="polling")
-                    if self.polling_client:
-                        pending_tasks, polling_context = await self.polling_client.get_pending_tasks(
-                            task_id=task_id,
-                            token_id=token_id,
-                            access_token=token,
-                            polling_context=polling_context,
+                    pending_tasks, polling_context = await self.polling_client.get_pending_tasks(
+                        task_id=task_id,
+                        token_id=token_id,
+                        access_token=token,
+                        polling_context=polling_context,
+                    )
+                    if polling_context:
+                        await self.db.update_task_polling_context(
+                            task_id,
+                            json.dumps(polling_context.to_dict(), ensure_ascii=False),
                         )
-                        if polling_context:
-                            await self.db.update_task_polling_context(
-                                task_id,
-                                json.dumps(polling_context.to_dict(), ensure_ascii=False),
-                            )
-                    else:
-                        pending_tasks = await self.sora_client.get_pending_tasks(token, token_id=token_id)
 
                     # Find matching task in pending tasks
                     task_found = False
@@ -1053,11 +1142,24 @@ class GenerationHandler:
                                 progress_pct = int(progress_pct * 100)
 
                             # Update last_progress for tracking
-                            last_progress = progress_pct
+                            previous_progress = last_progress
+                            previous_status = last_pending_status
                             status = task.get("status", "processing")
+                            last_progress = progress_pct
+                            last_pending_status = status
 
                             # Update database with current progress
                             await self.db.update_task(task_id, "processing", progress_pct)
+                            if status != previous_status or progress_pct != previous_progress:
+                                await self._record_task_event(
+                                    task_id,
+                                    token_id,
+                                    "pending_progress",
+                                    "polling",
+                                    "running",
+                                    f"pending progress updated to {progress_pct}%",
+                                    {"status": status, "progress_pct": progress_pct},
+                                )
 
                             # Output status every 30 seconds (not just when progress changes)
                             current_time = time.time()
@@ -1072,31 +1174,53 @@ class GenerationHandler:
                     # If task not found in pending tasks, it's completed - fetch from drafts
                     if not task_found:
                         debug_logger.log_info(f"Task {task_id} not found in pending tasks, fetching from drafts...")
+                        await self._record_task_event(
+                            task_id,
+                            token_id,
+                            "pending_empty",
+                            "polling",
+                            "success",
+                            "task disappeared from pending; switching to drafts_v2",
+                            {"drafts_api_version": "v2"},
+                        )
                         await self.db.update_task_stage(task_id, current_stage="drafts_lookup")
-                        if self.polling_client:
-                            result, polling_context = await self.polling_client.get_video_drafts(
-                                task_id=task_id,
-                                token_id=token_id,
-                                access_token=token,
-                                polling_context=polling_context,
+                        result, polling_context = await self.polling_client.get_video_drafts(
+                            task_id=task_id,
+                            token_id=token_id,
+                            access_token=token,
+                            polling_context=polling_context,
+                        )
+                        if polling_context:
+                            await self.db.update_task_polling_context(
+                                task_id,
+                                json.dumps(polling_context.to_dict(), ensure_ascii=False),
                             )
-                            if polling_context:
-                                await self.db.update_task_polling_context(
-                                    task_id,
-                                    json.dumps(polling_context.to_dict(), ensure_ascii=False),
-                                )
-                        else:
-                            result = await self.sora_client.get_video_drafts(token, token_id=token_id)
                         items = result.get("items", [])
 
                         # Find matching task in drafts
+                        matched_draft = False
                         for item in items:
                             if item.get("task_id") == task_id:
+                                matched_draft = True
                                 # Check for content violation
                                 kind = item.get("kind")
                                 reason_str = item.get("reason_str") or item.get("markdown_reason_str")
                                 url = item.get("url") or item.get("downloadable_url")
                                 debug_logger.log_info(f"Found task {task_id} in drafts with kind: {kind}, reason_str: {reason_str}, has_url: {bool(url)}")
+                                await self._record_task_event(
+                                    task_id,
+                                    token_id,
+                                    "drafts_lookup_hit",
+                                    "drafts_lookup",
+                                    "success",
+                                    "drafts_v2 returned matching task",
+                                    {
+                                        "kind": kind,
+                                        "has_url": bool(url),
+                                        "page_url": polling_context.page_url if polling_context else None,
+                                        "drafts_api_version": "v2",
+                                    },
+                                )
 
                                 # Check if content violates policy
                                 # Violation indicators: kind is violation type, or has reason_str, or missing video URL
@@ -1327,6 +1451,15 @@ class GenerationHandler:
 
                                 # Task completed
                                 await self.db.update_task_stage(task_id, current_stage="result_ready")
+                                await self._record_task_event(
+                                    task_id,
+                                    token_id,
+                                    "result_ready",
+                                    "result_ready",
+                                    "success",
+                                    "video result URL is ready",
+                                    {"result_url": local_url},
+                                )
                                 await self.db.update_task(
                                     task_id, "completed", 100.0,
                                     result_urls=json.dumps([local_url])
@@ -1340,6 +1473,8 @@ class GenerationHandler:
                                     )
                                     yield "data: [DONE]\n\n"
                                 return
+                        if not matched_draft:
+                            raise PollingClientError("polling_drafts_not_found", f"drafts_v2 did not return task {task_id}")
                 else:
                     result = await self.sora_client.get_image_tasks(token, token_id=token_id)
                     task_responses = result.get("task_responses", [])
@@ -1460,15 +1595,41 @@ class GenerationHandler:
                         )
             
             except Exception as e:
-                if isinstance(e, PollingClientError) and e.code == "polling_auth_refresh_failed":
+                if isinstance(e, PollingClientError):
+                    failure_stage = "drafts_lookup" if e.code.startswith("polling_drafts") else "polling"
+                    failure_category = "polling_auth" if e.code in {
+                        "polling_auth_refresh_failed",
+                        "polling_pending_unauthorized",
+                        "polling_drafts_unauthorized",
+                    } else "polling"
+                    await self._record_video_polling_failure(
+                        task_id,
+                        token_id,
+                        failure_stage,
+                        e.code,
+                        str(e),
+                        {
+                            "task_id": task_id,
+                            "page_url": polling_context.page_url if polling_context else None,
+                            "drafts_api_version": "v2",
+                        },
+                    )
                     await self.db.update_task_stage(
                         task_id,
-                        current_stage="polling",
-                        failure_stage="polling",
+                        current_stage=failure_stage,
+                        failure_stage=failure_stage,
                         error_code=e.code,
-                        error_category="polling_auth",
+                        error_category=failure_category,
                     )
-                    await self.db.update_task(task_id, "failed", last_progress, error_message=str(e))
+                    await self.db.update_task(task_id, "failed", last_progress, error_message=str(e), current_stage=failure_stage)
+                    if log_id and start_time:
+                        duration = time.time() - start_time
+                        await self.db.update_request_log(
+                            log_id,
+                            response_body=json.dumps({"error": str(e), "error_code": e.code}),
+                            status_code=502,
+                            duration=duration,
+                        )
                     raise
 
                 # Check for CF shield/429 error - don't retry these
@@ -1666,6 +1827,65 @@ class GenerationHandler:
             return None
         return json.dumps(submission.polling_context.to_dict(), ensure_ascii=False)
 
+    async def _record_task_event(
+        self,
+        task_id: str,
+        token_id: Optional[int],
+        event_type: str,
+        stage: str,
+        status: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+        error_code: Optional[str] = None,
+    ):
+        await self.db.create_task_event(
+            task_id=task_id,
+            token_id=token_id,
+            event_type=event_type,
+            stage=stage,
+            status=status,
+            message=message,
+            details=json.dumps(details, ensure_ascii=False) if details is not None else None,
+            error_code=error_code,
+            error_reason=message if error_code else None,
+        )
+
+    async def _record_video_polling_failure(
+        self,
+        task_id: str,
+        token_id: Optional[int],
+        stage: str,
+        error_code: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ):
+        await self.db.update_task_stage(
+            task_id,
+            current_stage=stage,
+            failure_stage=stage,
+            error_code=error_code,
+            error_category="polling",
+        )
+        await self.db.create_error_attribution(
+            task_id=task_id,
+            token_id=token_id,
+            mutation_type="video_polling",
+            stage=stage,
+            error_code=error_code,
+            error_reason=message,
+            details=json.dumps(details, ensure_ascii=False) if details is not None else None,
+        )
+        await self._record_task_event(
+            task_id,
+            token_id,
+            "polling_failed",
+            stage,
+            "error",
+            message,
+            details=details,
+            error_code=error_code,
+        )
+
     # ==================== Prompt Enhancement Handler ====================
 
     async def _handle_prompt_enhance(self, prompt: str, model_config: Dict, stream: bool) -> AsyncGenerator[str, None]:
@@ -1680,15 +1900,7 @@ class GenerationHandler:
         duration_s = model_config["duration_s"]
 
         # Select token
-        token_obj = await self.load_balancer.select_token(for_video_generation=True)
-        if not token_obj:
-            error_msg = "No available tokens for prompt enhancement"
-            if stream:
-                yield self._format_stream_chunk(reasoning_content=f"**Error:** {error_msg}", is_first=True)
-                yield self._format_stream_chunk(finish_reason="STOP")
-            else:
-                yield self._format_non_stream_response(error_msg)
-            return
+        token_obj = await self._select_video_token_or_raise("No available tokens for prompt enhancement")
 
         try:
             # Call enhance_prompt API
@@ -1735,9 +1947,7 @@ class GenerationHandler:
         7. Set character as public
         8. Return success message
         """
-        token_obj = await self.load_balancer.select_token(for_video_generation=True)
-        if not token_obj:
-            raise Exception("No available tokens for character creation")
+        token_obj = await self._select_video_token_or_raise("No available tokens for character creation")
 
         start_time = time.time()
         try:
@@ -1928,9 +2138,7 @@ class GenerationHandler:
 
     async def _handle_character_creation_from_generation_id(self, generation_id: str, model_config: Dict) -> AsyncGenerator[str, None]:
         """Handle character creation from generation id (gen_xxx)."""
-        token_obj = await self.load_balancer.select_token(for_video_generation=True)
-        if not token_obj:
-            raise Exception("No available tokens for character creation")
+        token_obj = await self._select_video_token_or_raise("No available tokens for character creation")
 
         start_time = time.time()
         normalized_generation_id = self._extract_generation_id((generation_id or "").strip())
@@ -2123,9 +2331,7 @@ class GenerationHandler:
         8. Delete character
         9. Return video result
         """
-        token_obj = await self.load_balancer.select_token(for_video_generation=True)
-        if not token_obj:
-            raise Exception("No available tokens for video generation")
+        token_obj = await self._select_video_token_or_raise("No available tokens for video generation")
 
         character_id = None
         start_time = time.time()
@@ -2370,9 +2576,7 @@ class GenerationHandler:
         4. Poll for results
         5. Return video result
         """
-        token_obj = await self.load_balancer.select_token(for_video_generation=True)
-        if not token_obj:
-            raise Exception("No available tokens for remix generation")
+        token_obj = await self._select_video_token_or_raise("No available tokens for remix generation")
 
         task_id = None
         try:
@@ -2469,9 +2673,7 @@ class GenerationHandler:
 
     async def _handle_video_extension(self, prompt: str, model_config: Dict, model_name: str) -> AsyncGenerator[str, None]:
         """Handle long video extension generation."""
-        token_obj = await self.load_balancer.select_token(for_video_generation=True)
-        if not token_obj:
-            raise Exception("No available tokens for video extension generation")
+        token_obj = await self._select_video_token_or_raise("No available tokens for video extension generation")
 
         task_id = None
         start_time = time.time()

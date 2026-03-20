@@ -58,6 +58,18 @@ class ProxyManager:
         # Fallback to standard proxy resolution
         return await self.get_proxy_url(token_id=token_id)
 
+    async def get_video_proxy_url(self, token_id: Optional[int]) -> Optional[str]:
+        """Get the token-bound proxy URL for browser-backed video paths.
+
+        This intentionally does not fall back to global proxy settings.
+        """
+        if token_id is None:
+            return None
+        token = await self.db.get_token(token_id)
+        if token and token.proxy_url:
+            return token.proxy_url
+        return None
+
     async def update_proxy_config(
         self,
         enabled: bool,

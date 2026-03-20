@@ -411,15 +411,5 @@ class Config:
         """Whether secret encryption is enabled."""
         return bool(secret_codec.is_configured)
 
-    @property
-    def egress_probe_url(self) -> str:
-        """Optional HTTPS endpoint that returns network identity JSON."""
-        return self._config.get("egress_probe", {}).get("url", "")
-
-    @property
-    def egress_probe_timeout_ms(self) -> int:
-        """Timeout for browser/server egress probes."""
-        return int(self._config.get("egress_probe", {}).get("timeout_ms", 8000))
-
 # Global config instance
 config = Config()

@@ -100,6 +100,24 @@ class MutationExecutorPolicyTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.code, "replay_not_allowed")
 
+    def test_video_token_requires_explicit_proxy_binding(self):
+        async def scenario():
+            token_obj = SimpleNamespace(
+                id=1,
+                is_active=True,
+                browser_provider="nst",
+                browser_profile_id="profile-1",
+                proxy_url=None,
+                account_status="ready",
+            )
+            db = _FakeDb([token_obj], {1: token_obj})
+            executor = MutationExecutor(db, _FakeProvider(), proxy_manager=None)
+            with self.assertRaises(BrowserProviderError) as ctx:
+                await executor.ensure_video_token_binding(1)
+            self.assertEqual(ctx.exception.code, "browser_proxy_binding_required")
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

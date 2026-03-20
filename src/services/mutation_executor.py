@@ -6,8 +6,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from curl_cffi.requests import AsyncSession
-
 from ..core.config import config
 from ..core.logger import debug_logger
 from .browser_provider import (
@@ -15,7 +13,6 @@ from .browser_provider import (
     BrowserMutationRequest,
     BrowserProvider,
     BrowserProviderError,
-    EgressProbeObservation,
     MutationResult,
 )
 from .browser_runtime import BrowserRuntime
@@ -161,40 +158,19 @@ class MutationExecutor:
             f"mutation={mutation_type} index={index} task={task_id or '-'} status={status_code} duration={duration:.2f}s"
         )
 
-    async def _probe_server_egress(self, token_id: Optional[int]) -> Optional[EgressProbeObservation]:
-        if not config.egress_probe_url:
-            return None
-        proxy_url = None
-        if self.proxy_manager:
-            proxy_url = await self.proxy_manager.get_proxy_url(token_id)
-        try:
-            async with AsyncSession(impersonate="chrome") as session:
-                response = await session.get(
-                    config.egress_probe_url,
-                    proxy=proxy_url,
-                    timeout=max(config.egress_probe_timeout_ms / 1000, 1),
-                    headers={"Accept": "application/json", "Cache-Control": "no-store"},
-                )
-            if response.status_code != 200:
-                debug_logger.log_warning(f"[MutationExecutor] Server egress probe failed: {response.status_code}")
-                return None
-            return EgressProbeObservation.from_payload(response.json())
-        except Exception as exc:
-            debug_logger.log_warning(f"[MutationExecutor] Server egress probe error: {exc}")
-            return None
-
-    async def _enrich_egress_binding(self, token_id: Optional[int], auth_context: AuthContext):
-        proxy_policy = None
-        if self.proxy_manager:
-            proxy_policy = await self.proxy_manager.get_proxy_url(token_id)
-        auth_context.egress_binding.proxy_policy = proxy_policy
-        auth_context.egress_binding.server_observation = await self._probe_server_egress(token_id)
-        browser_obs = auth_context.egress_binding.browser_observation
-        server_obs = auth_context.egress_binding.server_observation
-        auth_context.egress_binding.same_network_identity_proven = bool(
-            browser_obs and server_obs and browser_obs.ip and server_obs.ip and browser_obs.asn and server_obs.asn
-            and browser_obs.ip == server_obs.ip and browser_obs.asn == server_obs.asn
-        )
+    async def ensure_video_token_binding(self, token_id: Optional[int]):
+        token_obj = await self.db.get_token(token_id) if token_id else None
+        provider_name = (
+            token_obj.browser_provider if token_obj and token_obj.browser_provider else config.browser_provider
+        ).strip() or "nst"
+        expected_provider = getattr(self.provider, "provider_name", provider_name) if self.provider else provider_name
+        if provider_name != expected_provider:
+            raise BrowserProviderError("browser_profile_binding_required", "Video tokens require an NST browser profile binding")
+        if not token_obj or not token_obj.browser_profile_id:
+            raise BrowserProviderError("browser_profile_binding_required", "Video tokens require explicit browser_profile_id binding")
+        if not token_obj.proxy_url:
+            raise BrowserProviderError("browser_proxy_binding_required", "Video tokens require proxy_url synchronized from the browser profile")
+        return token_obj
 
     async def _persist_auth_context(self, token_id: Optional[int], auth_context: AuthContext):
         if not token_id:
@@ -212,10 +188,6 @@ class MutationExecutor:
             last_challenge_reason="",
             last_browser_user_agent=auth_context.user_agent,
             last_device_id=auth_context.device_id,
-            last_egress_binding=auth_context.egress_binding.binding_key,
-            last_egress_status=auth_context.egress_binding.status,
-            last_egress_probe_at=auth_context.refreshed_at,
-            last_egress_probe_details=json.dumps(auth_context.egress_binding.to_dict(), ensure_ascii=False),
             last_auth_context_hash=auth_context.auth_context_hash,
             last_auth_context_expires_at=auth_context.expires_at,
             last_auth_page_url=auth_context.page_url,
@@ -314,7 +286,6 @@ class MutationExecutor:
                     window_lock_key = f"{profile_id}:{page_context.page_id or page_context.page_url}"
                     async with self.runtime.window_lock(window_lock_key):
                         auth_context = await self.provider.refresh_auth_context(connection, flow, preferred_url=preferred_url)
-                        await self._enrich_egress_binding(token_id, auth_context)
                         await self._persist_auth_context(token_id, auth_context)
                         if task_id:
                             await self._record_task_event(
@@ -324,7 +295,7 @@ class MutationExecutor:
                                 "auth_refresh",
                                 "success",
                                 "polling auth context refreshed",
-                                {"profile_id": profile_id, "egress_status": auth_context.egress_binding.status},
+                                {"profile_id": profile_id, "page_url": auth_context.page_url},
                             )
                         return auth_context
                 except BrowserProviderError as exc:
@@ -379,7 +350,6 @@ class MutationExecutor:
                         await self.db.update_mutation_attempt(attempt_id, stage="readiness", status="running", window_id=page_context.page_id, page_url=page_context.page_url)
                         await self._record_task_event(task_id, token_id, "readiness", "readiness", "success", "page ready", {"page_url": page_context.page_url})
                         auth_context = await self.provider.refresh_auth_context(connection, policy.flow, preferred_url=preferred_url)
-                        await self._enrich_egress_binding(token_id, auth_context)
                         await self.db.update_mutation_attempt(attempt_id, stage="auth_refresh", status="running", egress_binding=auth_context.egress_binding.binding_key, page_url=auth_context.page_url)
                         await self._persist_auth_context(token_id, auth_context)
                         await self._record_task_event(
@@ -391,9 +361,8 @@ class MutationExecutor:
                             "page auth context refreshed",
                             {
                                 "profile_id": auth_context.profile_id,
-                                "egress_binding": auth_context.egress_binding.binding_key,
-                                "egress_status": auth_context.egress_binding.status,
-                                "same_network_identity_proven": auth_context.egress_binding.same_network_identity_proven,
+                                "page_url": auth_context.page_url,
+                                "proxy_url_present": bool(auth_context.egress_binding.proxy_url),
                             },
                         )
                         for index, request in enumerate(request_plan, start=1):
@@ -440,6 +409,7 @@ class MutationExecutor:
                         await self.provider.disconnect(connection)
 
     async def execute_video_submit(self, prompt: str, token_id: Optional[int], orientation: str, n_frames: int, model: str, size: str, media_id: Optional[str] = None, style_id: Optional[str] = None) -> MutationResult:
+        await self.ensure_video_token_binding(token_id)
         inpaint_items = [{"kind": "upload", "upload_id": media_id}] if media_id else []
         result = await self._run_page_plan(
             mutation_type=MutationType.VIDEO_SUBMIT,
@@ -472,6 +442,7 @@ class MutationExecutor:
         return result
 
     async def execute_storyboard_submit(self, prompt: str, token_id: Optional[int], orientation: str, media_id: Optional[str], n_frames: int, style_id: Optional[str]) -> MutationResult:
+        await self.ensure_video_token_binding(token_id)
         inpaint_items = [{"kind": "upload", "upload_id": media_id}] if media_id else []
         result = await self._run_page_plan(
             mutation_type=MutationType.STORYBOARD_SUBMIT,
@@ -504,6 +475,7 @@ class MutationExecutor:
         return result
 
     async def execute_remix_submit(self, remix_target_id: str, prompt: str, token_id: Optional[int], orientation: str, n_frames: int, style_id: Optional[str]) -> MutationResult:
+        await self.ensure_video_token_binding(token_id)
         result = await self._run_page_plan(
             mutation_type=MutationType.REMIX_SUBMIT,
             token_id=token_id,
@@ -535,6 +507,7 @@ class MutationExecutor:
         return result
 
     async def execute_long_video_extension(self, generation_id: str, prompt: str, extension_duration_s: int, token_id: Optional[int]) -> MutationResult:
+        await self.ensure_video_token_binding(token_id)
         result = await self._run_page_plan(
             mutation_type=MutationType.LONG_VIDEO_EXTENSION,
             token_id=token_id,

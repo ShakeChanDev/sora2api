@@ -20,6 +20,7 @@ class _FakeResponse:
 
 class _FakeSession:
     responses = []
+    requests = []
 
     async def __aenter__(self):
         return self
@@ -30,6 +31,12 @@ class _FakeSession:
     async def get(self, url, headers=None, proxy=None, timeout=None):
         if not self.responses:
             raise RuntimeError("no fake responses configured")
+        self.requests.append({
+            "url": url,
+            "headers": headers or {},
+            "proxy": proxy,
+            "timeout": timeout,
+        })
         return self.responses.pop(0)
 
 
@@ -39,6 +46,7 @@ class _FakeDb:
         self.log_updates = []
         self.task_updates = []
         self.tasks = {}
+        self.task_events = []
 
     async def log_request(self, log):
         self.logs.append(log)
@@ -57,10 +65,25 @@ class _FakeDb:
             return None
         return type("Task", (), {"polling_context": payload})
 
+    async def create_task_event(self, **kwargs):
+        self.task_events.append(kwargs)
+        return len(self.task_events)
+
 
 class _FakeProxyManager:
+    def __init__(self, video_proxy_url=None, fallback_proxy_url=None):
+        self.video_proxy_url = video_proxy_url
+        self.fallback_proxy_url = fallback_proxy_url
+        self.video_calls = 0
+        self.fallback_calls = 0
+
+    async def get_video_proxy_url(self, token_id=None):
+        self.video_calls += 1
+        return self.video_proxy_url
+
     async def get_proxy_url(self, token_id=None, proxy_url=None):
-        return None
+        self.fallback_calls += 1
+        return self.fallback_proxy_url
 
 
 class _FakeAuthContext:
@@ -99,6 +122,14 @@ class PollingClientTests(unittest.TestCase):
             user_agent="ua",
             device_id="device",
             profile_id="profile-1",
+            page_url="https://sora.chatgpt.com/explore",
+            referer="https://sora.chatgpt.com/explore",
+            sec_fetch_site="same-origin",
+            sec_fetch_mode="cors",
+            sec_fetch_dest="empty",
+            sec_ch_ua='"Chromium";v="143", "Google Chrome";v="143"',
+            sec_ch_ua_mobile="?0",
+            sec_ch_ua_platform='"Windows"',
             egress_binding=binding,
         )
 
@@ -106,19 +137,30 @@ class PollingClientTests(unittest.TestCase):
         async def scenario():
             db = _FakeDb()
             mutation_executor = _FakeMutationExecutor(self.polling_context)
-            client = PollingClient(db, _FakeProxyManager(), mutation_executor, base_url="https://example.com")
+            proxy_manager = _FakeProxyManager(video_proxy_url="http://token-proxy:8080", fallback_proxy_url="http://global-proxy:8080")
+            client = PollingClient(db, proxy_manager, mutation_executor, base_url="https://example.com")
+            _FakeSession.requests = []
             _FakeSession.responses = [
                 _FakeResponse(403, {"error": "forbidden"}),
                 _FakeResponse(200, [{"id": "task_1"}]),
             ]
             with patch("src.services.polling_client.AsyncSession", return_value=_FakeSession()):
-                payload, polling_context = await client.get_pending_tasks("task_1", 1, "at")
+                payload, polling_context = await client.get_pending_tasks("task_1", 1, "at", self.polling_context)
             self.assertEqual(payload[0]["id"], "task_1")
             self.assertEqual(mutation_executor.refresh_calls, 1)
             self.assertIsNotNone(polling_context)
             self.assertEqual(len(db.task_updates), 1)
             self.assertEqual(len(db.logs), 0)
             self.assertEqual(len(db.log_updates), 0)
+            self.assertEqual(_FakeSession.requests[-1]["url"], "https://example.com/nf/pending/v2")
+            self.assertEqual(_FakeSession.requests[-1]["headers"]["referer"], "https://sora.chatgpt.com/explore")
+            self.assertEqual(_FakeSession.requests[-1]["headers"]["sec-fetch-site"], "same-origin")
+            self.assertEqual(_FakeSession.requests[-1]["headers"]["sec-ch-ua-platform"], '"Windows"')
+            self.assertNotIn("openai-sentinel-token", _FakeSession.requests[-1]["headers"])
+            self.assertEqual(_FakeSession.requests[-1]["proxy"], "http://token-proxy:8080")
+            self.assertEqual(proxy_manager.video_calls, 2)
+            self.assertEqual(proxy_manager.fallback_calls, 0)
+            self.assertGreaterEqual(len(db.task_events), 3)
 
         asyncio.run(scenario())
 
@@ -126,16 +168,58 @@ class PollingClientTests(unittest.TestCase):
         async def scenario():
             db = _FakeDb()
             mutation_executor = _FakeMutationExecutor(self.polling_context)
-            client = PollingClient(db, _FakeProxyManager(), mutation_executor, base_url="https://example.com")
+            client = PollingClient(db, _FakeProxyManager(video_proxy_url="http://token-proxy:8080"), mutation_executor, base_url="https://example.com")
             _FakeSession.responses = [
                 _FakeResponse(403, {"error": "forbidden"}),
                 _FakeResponse(403, {"error": "still forbidden"}),
             ]
             with patch("src.services.polling_client.AsyncSession", return_value=_FakeSession()):
                 with self.assertRaises(PollingClientError) as ctx:
-                    await client.get_pending_tasks("task_1", 1, "at")
-            self.assertEqual(ctx.exception.code, "polling_auth_refresh_failed")
+                    await client.get_pending_tasks("task_1", 1, "at", self.polling_context)
+            self.assertEqual(ctx.exception.code, "polling_pending_unauthorized")
             self.assertEqual(mutation_executor.refresh_calls, 1)
+
+        asyncio.run(scenario())
+
+    def test_video_drafts_uses_v2_endpoint_and_validates_schema(self):
+        async def scenario():
+            db = _FakeDb()
+            mutation_executor = _FakeMutationExecutor(self.polling_context)
+            client = PollingClient(db, _FakeProxyManager(video_proxy_url="http://token-proxy:8080"), mutation_executor, base_url="https://example.com")
+            _FakeSession.requests = []
+            _FakeSession.responses = [
+                _FakeResponse(200, {"items": [{"task_id": "task_1"}]}),
+            ]
+            with patch("src.services.polling_client.AsyncSession", return_value=_FakeSession()):
+                payload, _ = await client.get_video_drafts("task_1", 1, "at", self.polling_context)
+            self.assertEqual(payload["items"][0]["task_id"], "task_1")
+            self.assertEqual(_FakeSession.requests[-1]["url"], "https://example.com/project_y/profile/drafts/v2?limit=15")
+
+        asyncio.run(scenario())
+
+    def test_video_drafts_invalid_schema_raises_structured_error(self):
+        async def scenario():
+            db = _FakeDb()
+            mutation_executor = _FakeMutationExecutor(self.polling_context)
+            client = PollingClient(db, _FakeProxyManager(video_proxy_url="http://token-proxy:8080"), mutation_executor, base_url="https://example.com")
+            _FakeSession.responses = [
+                _FakeResponse(200, {"unexpected": True}),
+            ]
+            with patch("src.services.polling_client.AsyncSession", return_value=_FakeSession()):
+                with self.assertRaises(PollingClientError) as ctx:
+                    await client.get_video_drafts("task_1", 1, "at", self.polling_context)
+            self.assertEqual(ctx.exception.code, "polling_drafts_schema_invalid")
+
+        asyncio.run(scenario())
+
+    def test_missing_video_proxy_binding_raises_structured_error(self):
+        async def scenario():
+            db = _FakeDb()
+            mutation_executor = _FakeMutationExecutor(self.polling_context)
+            client = PollingClient(db, _FakeProxyManager(video_proxy_url=None, fallback_proxy_url="http://global-proxy:8080"), mutation_executor, base_url="https://example.com")
+            with self.assertRaises(PollingClientError) as ctx:
+                await client.get_pending_tasks("task_1", 1, "at", self.polling_context)
+            self.assertEqual(ctx.exception.code, "browser_proxy_binding_required")
 
         asyncio.run(scenario())
 

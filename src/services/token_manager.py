@@ -20,6 +20,40 @@ class TokenManager:
         self._lock = asyncio.Lock()
         self.proxy_manager = ProxyManager(db)
         self.fake = Faker()
+
+    def _log_info(self, message: str):
+        """Write a best-effort info log without touching stdout."""
+        try:
+            debug_logger.log_info(f"[TOKEN_MANAGER] {message}")
+        except Exception:
+            pass
+
+    def _log_warning(self, message: str):
+        """Write a best-effort warning log without touching stdout."""
+        try:
+            debug_logger.log_warning(f"[TOKEN_MANAGER] {message}")
+        except Exception:
+            pass
+
+    def _log_error(self, message: str):
+        """Write a best-effort error log without touching stdout."""
+        try:
+            debug_logger.log_error(f"[TOKEN_MANAGER] {message}", source="Server")
+        except Exception:
+            pass
+
+    def _mask_proxy_url(self, proxy_url: Optional[str]) -> str:
+        """Return a masked proxy string for safe logging."""
+        try:
+            return debug_logger.mask_proxy_url(proxy_url) or "none"
+        except Exception:
+            return "masked"
+
+    def _append_warning(self, warnings: List[str], code: str, error: Any):
+        """Collect a non-fatal warning without affecting control flow."""
+        warning = f"{code}: {error}"
+        warnings.append(warning)
+        self._log_warning(warning)
     
     async def decode_jwt(self, token: str) -> dict:
         """Decode JWT token without verification"""
@@ -109,7 +143,7 @@ class TokenManager:
                 "subscription_end": "2025-11-13T16:58:21Z"
             }
         """
-        print(f"🔍 开始获取订阅信息...")
+        self._log_info("Fetching subscription info")
         proxy_url = await self.proxy_manager.get_proxy_url(token_id, proxy_url)
 
         headers = {
@@ -118,8 +152,7 @@ class TokenManager:
 
         async with AsyncSession() as session:
             url = "https://sora.chatgpt.com/backend/billing/subscriptions"
-            print(f"📡 请求 URL: {url}")
-            print(f"🔑 使用 Token: {token[:30]}...")
+            self._log_info(f"Subscription URL: {url}")
 
             kwargs = {
                 "headers": headers,
@@ -129,14 +162,14 @@ class TokenManager:
 
             if proxy_url:
                 kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                self._log_info(f"Subscription using proxy {self._mask_proxy_url(proxy_url)}")
 
             response = await session.get(url, **kwargs)
-            print(f"📥 响应状态码: {response.status_code}")
+            self._log_info(f"Subscription response status={response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
-                print(f"📦 响应数据: {data}")
+                self._log_info("Subscription payload received")
 
                 # 提取第一个订阅信息
                 if data.get("data") and len(data["data"]) > 0:
@@ -148,18 +181,18 @@ class TokenManager:
                         "plan_title": plan.get("title", ""),
                         "subscription_end": subscription.get("end_ts", "")
                     }
-                    print(f"✅ 订阅信息提取成功: {result}")
+                    self._log_info("Subscription info extracted successfully")
                     return result
 
-                print(f"⚠️  响应数据中没有订阅信息")
+                self._log_warning("Subscription payload did not include plan data")
                 return {
                     "plan_type": "",
                     "plan_title": "",
                     "subscription_end": ""
                 }
             else:
-                print(f"❌ Failed to get subscription info: {response.status_code}")
-                print(f"📄 响应内容: {response.text}")
+                self._log_warning(f"Subscription fetch failed status={response.status_code}")
+                self._log_warning(f"Subscription error body={response.text[:500]}")
 
                 # Check for token_expired error
                 try:
@@ -176,7 +209,7 @@ class TokenManager:
         """Get Sora2 invite code"""
         proxy_url = await self.proxy_manager.get_proxy_url(token_id, proxy_url)
 
-        print(f"🔍 开始获取Sora2邀请码...")
+        self._log_info("Fetching Sora2 invite code")
 
         async with AsyncSession() as session:
             headers = {
@@ -192,18 +225,18 @@ class TokenManager:
 
             if proxy_url:
                 kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                self._log_info(f"Sora2 invite using proxy {self._mask_proxy_url(proxy_url)}")
 
             response = await session.get(
                 "https://sora.chatgpt.com/backend/project_y/invite/mine",
                 **kwargs
             )
 
-            print(f"📥 响应状态码: {response.status_code}")
+            self._log_info(f"Sora2 invite response status={response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
-                print(f"✅ Sora2邀请码获取成功: {data}")
+                self._log_info("Sora2 invite fetched successfully")
                 return {
                     "supported": True,
                     "invite_code": data.get("invite_code"),
@@ -211,8 +244,8 @@ class TokenManager:
                     "total_count": data.get("total_count", 0)
                 }
             else:
-                print(f"❌ 获取Sora2邀请码失败: {response.status_code}")
-                print(f"📄 响应内容: {response.text}")
+                self._log_warning(f"Sora2 invite fetch failed status={response.status_code}")
+                self._log_warning(f"Sora2 invite error body={response.text[:500]}")
 
                 # Check for specific errors
                 try:
@@ -226,7 +259,7 @@ class TokenManager:
 
                     # Check if it's 401 unauthorized (token doesn't support Sora2)
                     if response.status_code == 401 and "Unauthorized" in error_info.get("message", ""):
-                        print(f"⚠️  Token不支持Sora2，尝试激活...")
+                        self._log_warning("Sora2 invite unauthorized, attempting bootstrap activation")
 
                         # Try to activate Sora2
                         try:
@@ -236,7 +269,7 @@ class TokenManager:
                             )
 
                             if activate_response.status_code == 200:
-                                print(f"✅ Sora2激活请求成功，重新获取邀请码...")
+                                self._log_info("Sora2 bootstrap succeeded, retrying invite fetch")
 
                                 # Retry getting invite code
                                 retry_response = await session.get(
@@ -246,7 +279,7 @@ class TokenManager:
 
                                 if retry_response.status_code == 200:
                                     retry_data = retry_response.json()
-                                    print(f"✅ Sora2激活成功！邀请码: {retry_data}")
+                                    self._log_info("Sora2 invite retry succeeded after bootstrap")
                                     return {
                                         "supported": True,
                                         "invite_code": retry_data.get("invite_code"),
@@ -254,11 +287,11 @@ class TokenManager:
                                         "total_count": retry_data.get("total_count", 0)
                                     }
                                 else:
-                                    print(f"⚠️  激活后仍无法获取邀请码: {retry_response.status_code}")
+                                    self._log_warning(f"Sora2 invite retry failed status={retry_response.status_code}")
                             else:
-                                print(f"⚠️  Sora2激活失败: {activate_response.status_code}")
+                                self._log_warning(f"Sora2 bootstrap failed status={activate_response.status_code}")
                         except Exception as activate_e:
-                            print(f"⚠️  Sora2激活过程出错: {activate_e}")
+                            self._log_warning(f"Sora2 bootstrap error: {activate_e}")
 
                         return {
                             "supported": False,
@@ -284,7 +317,7 @@ class TokenManager:
         """
         proxy_url = await self.proxy_manager.get_proxy_url(token_id, proxy_url)
 
-        print(f"🔍 开始获取Sora2剩余次数...")
+        self._log_info("Fetching Sora2 remaining count")
 
         async with AsyncSession() as session:
             headers = {
@@ -301,18 +334,18 @@ class TokenManager:
 
             if proxy_url:
                 kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                self._log_info(f"Sora2 remaining-count using proxy {self._mask_proxy_url(proxy_url)}")
 
             response = await session.get(
                 "https://sora.chatgpt.com/backend/nf/check",
                 **kwargs
             )
 
-            print(f"📥 响应状态码: {response.status_code}")
+            self._log_info(f"Sora2 remaining-count response status={response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
-                print(f"✅ Sora2剩余次数获取成功: {data}")
+                self._log_info("Sora2 remaining-count fetched successfully")
 
                 rate_limit_info = data.get("rate_limit_and_credit_balance", {})
                 return {
@@ -322,8 +355,8 @@ class TokenManager:
                     "access_resets_in_seconds": rate_limit_info.get("access_resets_in_seconds", 0)
                 }
             else:
-                print(f"❌ 获取Sora2剩余次数失败: {response.status_code}")
-                print(f"📄 响应内容: {response.text[:500]}")
+                self._log_warning(f"Sora2 remaining-count failed status={response.status_code}")
+                self._log_warning(f"Sora2 remaining-count error body={response.text[:500]}")
                 return {
                     "success": False,
                     "remaining_count": 0,
@@ -342,7 +375,7 @@ class TokenManager:
         """
         proxy_url = await self.proxy_manager.get_proxy_url()
 
-        print(f"🔍 检查用户名是否可用: {username}")
+        self._log_info(f"Checking username availability for {username}")
 
         async with AsyncSession() as session:
             headers = {
@@ -359,23 +392,23 @@ class TokenManager:
 
             if proxy_url:
                 kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                self._log_info(f"Username check using proxy {self._mask_proxy_url(proxy_url)}")
 
             response = await session.post(
                 "https://sora.chatgpt.com/backend/project_y/profile/username/check",
                 **kwargs
             )
 
-            print(f"📥 响应状态码: {response.status_code}")
+            self._log_info(f"Username check response status={response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
                 available = data.get("available", False)
-                print(f"✅ 用户名检查结果: available={available}")
+                self._log_info(f"Username availability={available}")
                 return available
             else:
-                print(f"❌ 用户名检查失败: {response.status_code}")
-                print(f"📄 响应内容: {response.text[:500]}")
+                self._log_warning(f"Username check failed status={response.status_code}")
+                self._log_warning(f"Username check error body={response.text[:500]}")
                 return False
 
     async def set_username(self, access_token: str, username: str) -> dict:
@@ -390,7 +423,7 @@ class TokenManager:
         """
         proxy_url = await self.proxy_manager.get_proxy_url()
 
-        print(f"🔍 开始设置用户名: {username}")
+        self._log_info(f"Setting username to {username}")
 
         async with AsyncSession() as session:
             headers = {
@@ -407,22 +440,22 @@ class TokenManager:
 
             if proxy_url:
                 kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                self._log_info(f"Username set using proxy {self._mask_proxy_url(proxy_url)}")
 
             response = await session.post(
                 "https://sora.chatgpt.com/backend/project_y/profile/username/set",
                 **kwargs
             )
 
-            print(f"📥 响应状态码: {response.status_code}")
+            self._log_info(f"Username set response status={response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
-                print(f"✅ 用户名设置成功: {data.get('username')}")
+                self._log_info(f"Username set succeeded as {data.get('username')}")
                 return data
             else:
-                print(f"❌ 用户名设置失败: {response.status_code}")
-                print(f"📄 响应内容: {response.text[:500]}")
+                self._log_warning(f"Username set failed status={response.status_code}")
+                self._log_warning(f"Username set error body={response.text[:500]}")
                 raise Exception(f"Failed to set username: {response.status_code}")
 
     async def activate_sora2_invite(self, access_token: str, invite_code: str) -> dict:
@@ -430,8 +463,7 @@ class TokenManager:
         import uuid
         proxy_url = await self.proxy_manager.get_proxy_url()
 
-        print(f"🔍 开始激活Sora2邀请码: {invite_code}")
-        print(f"🔑 Access Token 前缀: {access_token[:50]}...")
+        self._log_info(f"Activating Sora2 invite code {invite_code}")
 
         async with AsyncSession() as session:
             # 生成设备ID
@@ -443,8 +475,7 @@ class TokenManager:
                 "cookie": f"oai-did={device_id}"
             }
 
-            print(f"🆔 设备ID: {device_id}")
-            print(f"📦 请求体: {{'invite_code': '{invite_code}'}}")
+            self._log_info("Generated transient device id for Sora2 activation")
 
             kwargs = {
                 "headers": headers,
@@ -455,25 +486,25 @@ class TokenManager:
 
             if proxy_url:
                 kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
+                self._log_info(f"Sora2 activation using proxy {self._mask_proxy_url(proxy_url)}")
 
             response = await session.post(
                 "https://sora.chatgpt.com/backend/project_y/invite/accept",
                 **kwargs
             )
 
-            print(f"📥 响应状态码: {response.status_code}")
+            self._log_info(f"Sora2 activation response status={response.status_code}")
 
             if response.status_code == 200:
                 data = response.json()
-                print(f"✅ Sora2激活成功: {data}")
+                self._log_info("Sora2 activation succeeded")
                 return {
                     "success": data.get("success", False),
                     "already_accepted": data.get("already_accepted", False)
                 }
             else:
-                print(f"❌ Sora2激活失败: {response.status_code}")
-                print(f"📄 响应内容: {response.text[:500]}")
+                self._log_warning(f"Sora2 activation failed status={response.status_code}")
+                self._log_warning(f"Sora2 activation error body={response.text[:500]}")
                 raise Exception(f"Failed to activate Sora2: {response.status_code}")
 
     async def st_to_at(self, session_token: str, proxy_url: Optional[str] = None) -> dict:
@@ -972,6 +1003,46 @@ class TokenManager:
         """Disable a token (manual disable)"""
         await self.db.update_token_status(token_id, False, "manual")
 
+    async def _ensure_account_username(self, access_token: str, current_username: Optional[str], warnings: List[str]) -> Optional[str]:
+        """Best-effort username normalization that never invalidates a token."""
+        if current_username is not None:
+            self._log_info(f"Username already present: {current_username}")
+            return current_username
+
+        self._log_warning("Username missing; attempting to assign one")
+        last_error: Optional[Exception] = None
+        max_attempts = 5
+
+        for attempt in range(max_attempts):
+            generated_username = self._generate_random_username()
+            self._log_info(f"Trying generated username {attempt + 1}/{max_attempts}: {generated_username}")
+
+            try:
+                is_available = await self.check_username_available(access_token, generated_username)
+            except Exception as exc:
+                last_error = exc
+                self._log_warning(f"Username availability check failed: {exc}")
+                continue
+
+            if not is_available:
+                self._log_info(f"Generated username unavailable: {generated_username}")
+                continue
+
+            try:
+                result = await self.set_username(access_token, generated_username)
+                final_username = result.get("username") or generated_username
+                self._log_info(f"Username set successfully: {final_username}")
+                return final_username
+            except Exception as exc:
+                last_error = exc
+                self._log_warning(f"Username set attempt failed: {exc}")
+
+        if last_error:
+            self._append_warning(warnings, "username_sync_failed", last_error)
+        else:
+            self._append_warning(warnings, "username_sync_failed", "no available generated username")
+        return current_username
+
     async def test_token(self, token_id: int) -> dict:
         """Test if a token is valid by calling Sora API and refresh account info (subscription + Sora2)"""
         # Get token from database
@@ -980,91 +1051,16 @@ class TokenManager:
             return {"valid": False, "message": "Token not found"}
 
         try:
-            # Try to get user info from Sora API
             user_info = await self.get_user_info(token_data.token, token_id)
-
-            # Get subscription info from Sora API
-            plan_type = None
-            plan_title = None
-            subscription_end = None
-            try:
-                sub_info = await self.get_subscription_info(token_data.token, token_id)
-                plan_type = sub_info.get("plan_type")
-                plan_title = sub_info.get("plan_title")
-                # Parse subscription end time
-                if sub_info.get("subscription_end"):
-                    from dateutil import parser
-                    subscription_end = parser.parse(sub_info["subscription_end"])
-            except Exception as e:
-                print(f"Failed to get subscription info: {e}")
-
-            # Refresh Sora2 invite code and counts
-            sora2_info = await self.get_sora2_invite_code(token_data.token, token_id)
-            sora2_supported = sora2_info.get("supported", False)
-            sora2_invite_code = sora2_info.get("invite_code")
-            sora2_redeemed_count = sora2_info.get("redeemed_count", 0)
-            sora2_total_count = sora2_info.get("total_count", 0)
-            sora2_remaining_count = 0
-
-            # If Sora2 is supported, get remaining count
-            if sora2_supported:
-                try:
-                    remaining_info = await self.get_sora2_remaining_count(token_data.token, token_id)
-                    if remaining_info.get("success"):
-                        sora2_remaining_count = remaining_info.get("remaining_count", 0)
-                except Exception as e:
-                    print(f"Failed to get Sora2 remaining count: {e}")
-
-            # Update token subscription info in database
-            await self.db.update_token(
-                token_id,
-                plan_type=plan_type,
-                plan_title=plan_title,
-                subscription_end=subscription_end,
-                sora_available=sora2_supported,
-                account_status="ready"
-            )
-
-            # Update token Sora2 info in database
-            await self.db.update_token_sora2(
-                token_id,
-                supported=sora2_supported,
-                invite_code=sora2_invite_code,
-                redeemed_count=sora2_redeemed_count,
-                total_count=sora2_total_count,
-                remaining_count=sora2_remaining_count
-            )
-
-            # Clear expired flag if token is valid
-            await self.db.clear_token_expired(token_id)
-
-            return {
-                "valid": True,
-                "message": "Token is valid and account info updated",
-                "email": user_info.get("email"),
-                "username": user_info.get("username"),
-                "plan_type": plan_type,
-                "plan_title": plan_title,
-                "subscription_end": subscription_end.isoformat() if subscription_end else None,
-                "sora2_supported": sora2_supported,
-                "sora2_invite_code": sora2_invite_code,
-                "sora2_redeemed_count": sora2_redeemed_count,
-                "sora2_total_count": sora2_total_count,
-                "sora2_remaining_count": sora2_remaining_count
-            }
         except Exception as e:
             error_msg = str(e)
-            # Check if error is 401 with token_invalidated
             if "401" in error_msg and "token_invalidated" in error_msg.lower():
-                # Mark token as expired
                 await self.db.mark_token_expired(token_id)
                 return {
                     "valid": False,
                     "message": "Token已过期（token_invalidated）"
                 }
-            # Check if error is "Failed to get user info:401"
             if "Failed to get user info:401" in error_msg or "Failed to get user info: 401" in error_msg:
-                # Mark token as invalid and disable it
                 await self.db.mark_token_invalid(token_id)
                 return {
                     "valid": False,
@@ -1079,6 +1075,105 @@ class TokenManager:
                 "valid": False,
                 "message": f"Token is invalid: {error_msg}"
             }
+
+        warnings: List[str] = []
+        username = user_info.get("username")
+        username = await self._ensure_account_username(token_data.token, username, warnings)
+
+        plan_type = token_data.plan_type
+        plan_title = token_data.plan_title
+        subscription_end = token_data.subscription_end
+        subscription_loaded = False
+        try:
+            sub_info = await self.get_subscription_info(token_data.token, token_id)
+            plan_type = sub_info.get("plan_type")
+            plan_title = sub_info.get("plan_title")
+            if sub_info.get("subscription_end"):
+                from dateutil import parser
+                subscription_end = parser.parse(sub_info["subscription_end"])
+            else:
+                subscription_end = None
+            subscription_loaded = True
+        except Exception as e:
+            self._append_warning(warnings, "subscription_refresh_failed", e)
+
+        sora2_loaded = False
+        sora2_supported = token_data.sora2_supported if token_data.sora2_supported is not None else False
+        sora2_invite_code = token_data.sora2_invite_code
+        sora2_redeemed_count = token_data.sora2_redeemed_count
+        sora2_total_count = token_data.sora2_total_count
+        sora2_remaining_count = token_data.sora2_remaining_count
+
+        try:
+            sora2_info = await self.get_sora2_invite_code(token_data.token, token_id)
+            sora2_loaded = True
+            sora2_supported = sora2_info.get("supported", False)
+            sora2_invite_code = sora2_info.get("invite_code")
+            sora2_redeemed_count = sora2_info.get("redeemed_count", 0)
+            sora2_total_count = sora2_info.get("total_count", 0)
+            if sora2_supported:
+                try:
+                    remaining_info = await self.get_sora2_remaining_count(token_data.token, token_id)
+                    if remaining_info.get("success"):
+                        sora2_remaining_count = remaining_info.get("remaining_count", token_data.sora2_remaining_count)
+                    else:
+                        self._append_warning(
+                            warnings,
+                            "sora2_remaining_refresh_failed",
+                            remaining_info.get("error", "unknown remaining-count error"),
+                        )
+                except Exception as e:
+                    self._append_warning(warnings, "sora2_remaining_refresh_failed", e)
+            else:
+                sora2_remaining_count = 0
+        except Exception as e:
+            self._append_warning(warnings, "sora2_info_refresh_failed", e)
+
+        token_updates: Dict[str, Any] = {
+            "account_status": "ready",
+            "last_auth_error_reason": "",
+        }
+        if subscription_loaded:
+            token_updates.update(
+                plan_type=plan_type,
+                plan_title=plan_title,
+                subscription_end=subscription_end,
+            )
+        if sora2_loaded:
+            token_updates["sora_available"] = sora2_supported
+        await self.db.update_token(token_id, **token_updates)
+
+        if sora2_loaded:
+            await self.db.update_token_sora2(
+                token_id,
+                supported=sora2_supported,
+                invite_code=sora2_invite_code,
+                redeemed_count=sora2_redeemed_count,
+                total_count=sora2_total_count,
+                remaining_count=sora2_remaining_count
+            )
+
+        await self.db.clear_token_expired(token_id)
+
+        message = "Token is valid"
+        if warnings:
+            message = "Token is valid with warnings"
+
+        return {
+            "valid": True,
+            "message": message,
+            "warnings": warnings,
+            "email": user_info.get("email"),
+            "username": username,
+            "plan_type": plan_type,
+            "plan_title": plan_title,
+            "subscription_end": subscription_end.isoformat() if subscription_end else None,
+            "sora2_supported": sora2_supported,
+            "sora2_invite_code": sora2_invite_code,
+            "sora2_redeemed_count": sora2_redeemed_count,
+            "sora2_total_count": sora2_total_count,
+            "sora2_remaining_count": sora2_remaining_count
+        }
 
     async def record_usage(self, token_id: int, is_video: bool = False):
         """Record token usage"""
@@ -1120,7 +1215,7 @@ class TokenManager:
                     if remaining_info.get("success"):
                         remaining_count = remaining_info.get("remaining_count", 0)
                         await self.db.update_token_sora2_remaining(token_id, remaining_count)
-                        print(f"✅ 更新Token {token_id} 的Sora2剩余次数: {remaining_count}")
+                        self._log_info(f"Updated Sora2 remaining count for token {token_id}: {remaining_count}")
 
                         # If remaining count is 1 or less, disable token and set cooldown
                         if remaining_count <= 1:
@@ -1128,12 +1223,14 @@ class TokenManager:
                             if reset_seconds > 0:
                                 cooldown_until = datetime.now() + timedelta(seconds=reset_seconds)
                                 await self.db.update_token_sora2_cooldown(token_id, cooldown_until)
-                                print(f"⏱️ Token {token_id} 剩余次数为{remaining_count}，设置冷却时间至: {cooldown_until}")
+                                self._log_warning(
+                                    f"Token {token_id} remaining count={remaining_count}, cooldown until {cooldown_until}"
+                                )
                             # Disable token
                             await self.disable_token(token_id)
-                            print(f"🚫 Token {token_id} 剩余次数为{remaining_count}，已自动禁用")
+                            self._log_warning(f"Token {token_id} auto-disabled after remaining count reached {remaining_count}")
             except Exception as e:
-                print(f"Failed to update Sora2 remaining count: {e}")
+                self._log_warning(f"Failed to update Sora2 remaining count: {e}")
     
     async def refresh_sora2_remaining_if_cooldown_expired(self, token_id: int):
         """Refresh Sora2 remaining count if cooldown has expired"""
@@ -1144,7 +1241,7 @@ class TokenManager:
 
             # Check if Sora2 cooldown has expired
             if token_data.sora2_cooldown_until and token_data.sora2_cooldown_until <= datetime.now():
-                print(f"🔄 Token {token_id} Sora2冷却已过期，正在刷新剩余次数...")
+                self._log_info(f"Refreshing Sora2 remaining count after cooldown expiry for token {token_id}")
 
                 try:
                     remaining_info = await self.get_sora2_remaining_count(token_data.token, token_id)
@@ -1153,11 +1250,11 @@ class TokenManager:
                         await self.db.update_token_sora2_remaining(token_id, remaining_count)
                         # Clear cooldown
                         await self.db.update_token_sora2_cooldown(token_id, None)
-                        print(f"✅ Token {token_id} Sora2剩余次数已刷新: {remaining_count}")
+                        self._log_info(f"Cooldown refresh updated token {token_id} remaining count to {remaining_count}")
                 except Exception as e:
-                    print(f"Failed to refresh Sora2 remaining count: {e}")
+                    self._log_warning(f"Failed to refresh Sora2 remaining count: {e}")
         except Exception as e:
-            print(f"Error in refresh_sora2_remaining_if_cooldown_expired: {e}")
+            self._log_warning(f"refresh_sora2_remaining_if_cooldown_expired error: {e}")
 
     async def auto_refresh_expiring_token(self, token_id: int) -> bool:
         """

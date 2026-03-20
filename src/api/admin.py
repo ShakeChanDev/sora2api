@@ -5,6 +5,7 @@ from typing import List, Optional
 from datetime import datetime
 from pathlib import Path
 import secrets
+import json
 from pydantic import BaseModel
 from apscheduler.triggers.cron import CronTrigger
 from ..core.auth import AuthManager
@@ -232,7 +233,6 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
     """Get all tokens with statistics"""
     tokens = await token_manager.get_all_tokens()
     active_tokens = [item for item in tokens if item.is_active]
-    active_count = len(active_tokens)
     profile_counts = {}
     for item in active_tokens:
         if item.browser_profile_id:
@@ -241,16 +241,17 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
 
     for token in tokens:
         stats = await db.get_token_stats(token.id)
+        provider_name = (token.browser_provider if token.browser_provider else config.browser_provider).strip() or "nst"
         if token.browser_profile_id and profile_counts.get(token.browser_profile_id, 0) > 1:
             binding_status = "duplicate_profile_binding"
-        elif token.browser_profile_id:
-            binding_status = "bound"
-        elif token.is_active and config.browser_default_profile_id and active_count == 1:
-            binding_status = "bootstrap_default"
-        elif token.is_active and config.browser_default_profile_id and active_count > 1:
-            binding_status = "misconfigured"
+        elif provider_name == "nst" and token.browser_profile_id and token.proxy_url:
+            binding_status = "ready"
+        elif provider_name != "nst" or not token.browser_profile_id:
+            binding_status = "missing_profile"
+        elif not token.proxy_url:
+            binding_status = "missing_proxy"
         else:
-            binding_status = "unbound"
+            binding_status = "missing_profile"
         result.append({
             "id": token.id,
             "token": None,
@@ -310,14 +311,10 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
             "last_challenge_reason": token.last_challenge_reason,
             "last_browser_user_agent": token.last_browser_user_agent,
             "last_device_id": _masked_secret(token.last_device_id),
-            "last_egress_binding": token.last_egress_binding,
-            "last_egress_status": token.last_egress_status,
-            "last_egress_probe_at": token.last_egress_probe_at.isoformat() if token.last_egress_probe_at else None,
-            "last_egress_probe_details": debug_logger.sanitize_json_text(token.last_egress_probe_details),
-            "egress_status": token.last_egress_status or "unverified",
             "last_auth_context_hash": token.last_auth_context_hash,
             "last_auth_context_expires_at": token.last_auth_context_expires_at.isoformat() if token.last_auth_context_expires_at else None,
             "last_auth_page_url": token.last_auth_page_url,
+            "drafts_api_version": "v2",
         })
 
     return result
@@ -433,6 +430,8 @@ async def test_token(token_id: int, token: str = Depends(verify_admin_token)):
             "email": result.get("email"),
             "username": result.get("username")
         }
+        if result.get("warnings"):
+            response["warnings"] = result["warnings"]
 
         return response
     except Exception as e:
@@ -472,10 +471,16 @@ async def batch_test_update(request: BatchDisableRequest = None, token: str = De
                 result = await token_manager.test_token(token_obj.id)
                 if result.get("valid"):
                     success_count += 1
-                    results.append({"id": token_obj.id, "email": token_obj.email, "status": "success"})
+                    item = {"id": token_obj.id, "email": token_obj.email, "status": "success"}
+                    if result.get("warnings"):
+                        item["warnings"] = result["warnings"]
+                    results.append(item)
                 else:
                     failed_count += 1
-                    results.append({"id": token_obj.id, "email": token_obj.email, "status": "failed", "message": result.get("message")})
+                    item = {"id": token_obj.id, "email": token_obj.email, "status": "failed", "message": result.get("message")}
+                    if result.get("warnings"):
+                        item["warnings"] = result["warnings"]
+                    results.append(item)
             except Exception as e:
                 failed_count += 1
                 results.append({"id": token_obj.id, "email": token_obj.email, "status": "error", "message": str(e)})
@@ -1206,6 +1211,19 @@ async def get_logs(limit: int = 100, token: str = Depends(verify_admin_token)):
                 log_data["task_stage"] = task.current_stage
                 log_data["task_failure_stage"] = task.failure_stage
                 log_data["task_error_code"] = task.error_code
+                if task.polling_context:
+                    try:
+                        polling_context = json.loads(task.polling_context)
+                    except Exception:
+                        polling_context = None
+                    if isinstance(polling_context, dict):
+                        log_data["task_has_polling_context"] = True
+                        log_data["task_polling_page_url"] = polling_context.get("page_url") or polling_context.get("referer")
+                        log_data["task_drafts_api_version"] = "v2"
+                    else:
+                        log_data["task_has_polling_context"] = False
+                else:
+                    log_data["task_has_polling_context"] = False
 
         result.append(log_data)
 
