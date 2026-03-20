@@ -34,7 +34,6 @@ class DatabaseBrowserStateTests(unittest.TestCase):
                 browser_profile_id="profile-1",
                 account_status="ready",
                 last_auth_result="success",
-                last_egress_binding="binding-1",
             )
             attempt_id = await self.db.create_mutation_attempt(
                 token_id=token_id,
@@ -114,6 +113,83 @@ class DatabaseBrowserStateTests(unittest.TestCase):
         self.assertEqual(task.current_stage, "completed")
         self.assertEqual(task.auth_snapshot_id, "auth-1")
         self.assertIn('"profile_id":"profile-1"', task.polling_context)
+
+    def test_migration_drops_legacy_token_egress_columns(self):
+        async def scenario():
+            async with aiosqlite.connect(self.db_path) as raw_db:
+                await raw_db.execute("ALTER TABLE tokens ADD COLUMN last_egress_binding TEXT")
+                await raw_db.execute("ALTER TABLE tokens ADD COLUMN last_egress_status TEXT")
+                await raw_db.execute("ALTER TABLE tokens ADD COLUMN last_egress_probe_at TIMESTAMP")
+                await raw_db.execute("ALTER TABLE tokens ADD COLUMN last_egress_probe_details TEXT")
+                await raw_db.commit()
+
+            token_id = await self.db.add_token(
+                Token(
+                    token="tok",
+                    email="user@example.com",
+                    name="user",
+                    proxy_url="http://proxy:8080",
+                )
+            )
+            await self.db.update_token_browser_state(
+                token_id=token_id,
+                browser_provider="nst",
+                browser_profile_id="profile-1",
+                account_status="ready",
+                last_auth_result="success",
+                last_auth_context_hash="auth-hash-1",
+                last_auth_page_url="https://sora.chatgpt.com/drafts",
+            )
+
+            async with aiosqlite.connect(self.db_path) as raw_db:
+                await raw_db.execute(
+                    """
+                    UPDATE tokens
+                    SET last_egress_binding = ?, last_egress_status = ?, last_egress_probe_details = ?
+                    WHERE id = ?
+                    """,
+                    ("binding-1", "proven", '{"source":"legacy"}', token_id),
+                )
+                await raw_db.commit()
+
+            await self.db.check_and_migrate_db({})
+            token = await self.db.get_token(token_id)
+
+            async with aiosqlite.connect(self.db_path) as raw_db:
+                cursor = await raw_db.execute("PRAGMA table_info(tokens)")
+                columns = [row[1] for row in await cursor.fetchall()]
+                row_cursor = await raw_db.execute(
+                    """
+                    SELECT token, proxy_url, browser_provider, browser_profile_id, account_status,
+                           last_auth_context_hash, last_auth_page_url
+                    FROM tokens
+                    WHERE id = ?
+                    """,
+                    (token_id,),
+                )
+                row = await row_cursor.fetchone()
+            return token, columns, row
+
+        token, columns, row = asyncio.run(scenario())
+        self.assertIsNotNone(row)
+        self.assertNotIn("last_egress_binding", columns)
+        self.assertNotIn("last_egress_status", columns)
+        self.assertNotIn("last_egress_probe_at", columns)
+        self.assertNotIn("last_egress_probe_details", columns)
+        self.assertEqual(token.token, "tok")
+        self.assertEqual(token.proxy_url, "http://proxy:8080")
+        self.assertEqual(token.browser_provider, "nst")
+        self.assertEqual(token.browser_profile_id, "profile-1")
+        self.assertEqual(token.account_status, "ready")
+        self.assertEqual(token.last_auth_context_hash, "auth-hash-1")
+        self.assertEqual(token.last_auth_page_url, "https://sora.chatgpt.com/drafts")
+        self.assertTrue(row[0].startswith("enc:v1:"))
+        self.assertEqual(row[1], "http://proxy:8080")
+        self.assertEqual(row[2], "nst")
+        self.assertEqual(row[3], "profile-1")
+        self.assertEqual(row[4], "ready")
+        self.assertEqual(row[5], "auth-hash-1")
+        self.assertEqual(row[6], "https://sora.chatgpt.com/drafts")
 
     def test_recent_logs_collapse_to_primary_task_record(self):
         async def scenario():

@@ -21,6 +21,150 @@ from .models import (
 )
 from .secret_codec import secret_codec
 
+LEGACY_TOKEN_EGRESS_COLUMNS = (
+    "last_egress_binding",
+    "last_egress_status",
+    "last_egress_probe_at",
+    "last_egress_probe_details",
+)
+
+TOKEN_TABLE_COLUMNS = (
+    "id INTEGER PRIMARY KEY AUTOINCREMENT",
+    "token TEXT UNIQUE NOT NULL",
+    "token_hash TEXT",
+    "email TEXT NOT NULL",
+    "username TEXT NOT NULL",
+    "name TEXT NOT NULL",
+    "st TEXT",
+    "rt TEXT",
+    "client_id TEXT",
+    "proxy_url TEXT",
+    "remark TEXT",
+    "expiry_time TIMESTAMP",
+    "is_active BOOLEAN DEFAULT 1",
+    "cooled_until TIMESTAMP",
+    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    "last_used_at TIMESTAMP",
+    "use_count INTEGER DEFAULT 0",
+    "plan_type TEXT",
+    "plan_title TEXT",
+    "subscription_end TIMESTAMP",
+    "sora2_supported BOOLEAN",
+    "sora2_invite_code TEXT",
+    "sora2_redeemed_count INTEGER DEFAULT 0",
+    "sora2_total_count INTEGER DEFAULT 0",
+    "sora2_remaining_count INTEGER DEFAULT 0",
+    "sora2_cooldown_until TIMESTAMP",
+    "image_enabled BOOLEAN DEFAULT 1",
+    "video_enabled BOOLEAN DEFAULT 1",
+    "image_concurrency INTEGER DEFAULT -1",
+    "video_concurrency INTEGER DEFAULT -1",
+    "is_expired BOOLEAN DEFAULT 0",
+    "disabled_reason TEXT",
+    "browser_provider TEXT",
+    "browser_profile_id TEXT",
+    "sora_available BOOLEAN",
+    "account_status TEXT",
+    "last_auth_refresh_at TIMESTAMP",
+    "last_auth_result TEXT",
+    "last_auth_error_reason TEXT",
+    "last_challenge_reason TEXT",
+    "last_browser_user_agent TEXT",
+    "last_device_id TEXT",
+    "last_auth_context_hash TEXT",
+    "last_auth_context_expires_at TIMESTAMP",
+    "last_auth_page_url TEXT",
+)
+
+TOKEN_TABLE_DATA_COLUMNS = (
+    "id",
+    "token",
+    "token_hash",
+    "email",
+    "username",
+    "name",
+    "st",
+    "rt",
+    "client_id",
+    "proxy_url",
+    "remark",
+    "expiry_time",
+    "is_active",
+    "cooled_until",
+    "created_at",
+    "last_used_at",
+    "use_count",
+    "plan_type",
+    "plan_title",
+    "subscription_end",
+    "sora2_supported",
+    "sora2_invite_code",
+    "sora2_redeemed_count",
+    "sora2_total_count",
+    "sora2_remaining_count",
+    "sora2_cooldown_until",
+    "image_enabled",
+    "video_enabled",
+    "image_concurrency",
+    "video_concurrency",
+    "is_expired",
+    "disabled_reason",
+    "browser_provider",
+    "browser_profile_id",
+    "sora_available",
+    "account_status",
+    "last_auth_refresh_at",
+    "last_auth_result",
+    "last_auth_error_reason",
+    "last_challenge_reason",
+    "last_browser_user_agent",
+    "last_device_id",
+    "last_auth_context_hash",
+    "last_auth_context_expires_at",
+    "last_auth_page_url",
+)
+
+TOKEN_INSERT_COLUMNS = (
+    "token",
+    "token_hash",
+    "email",
+    "username",
+    "name",
+    "st",
+    "rt",
+    "client_id",
+    "proxy_url",
+    "remark",
+    "expiry_time",
+    "is_active",
+    "plan_type",
+    "plan_title",
+    "subscription_end",
+    "sora2_supported",
+    "sora2_invite_code",
+    "sora2_redeemed_count",
+    "sora2_total_count",
+    "sora2_remaining_count",
+    "sora2_cooldown_until",
+    "image_enabled",
+    "video_enabled",
+    "image_concurrency",
+    "video_concurrency",
+    "browser_provider",
+    "browser_profile_id",
+    "sora_available",
+    "account_status",
+    "last_auth_refresh_at",
+    "last_auth_result",
+    "last_auth_error_reason",
+    "last_challenge_reason",
+    "last_browser_user_agent",
+    "last_device_id",
+    "last_auth_context_hash",
+    "last_auth_context_expires_at",
+    "last_auth_page_url",
+)
+
 class Database:
     """SQLite database manager"""
 
@@ -77,6 +221,89 @@ class Database:
             return any(col[1] == column_name for col in columns)
         except:
             return False
+
+    def _tokens_table_sql(self, table_name: str = "tokens", if_not_exists: bool = True) -> str:
+        exists_clause = " IF NOT EXISTS" if if_not_exists else ""
+        column_sql = ",\n                    ".join(TOKEN_TABLE_COLUMNS)
+        return f"""
+                CREATE TABLE{exists_clause} {table_name} (
+                    {column_sql}
+                )
+            """
+
+    def _build_token_insert_payload(self, token: Token) -> Dict[str, Any]:
+        return {
+            "token": self._serialize_token_secret(token.token),
+            "token_hash": secret_codec.hash_secret(token.token),
+            "email": token.email,
+            "username": "",
+            "name": token.name,
+            "st": self._serialize_token_secret(token.st),
+            "rt": self._serialize_token_secret(token.rt),
+            "client_id": token.client_id,
+            "proxy_url": token.proxy_url,
+            "remark": token.remark,
+            "expiry_time": token.expiry_time,
+            "is_active": token.is_active,
+            "plan_type": token.plan_type,
+            "plan_title": token.plan_title,
+            "subscription_end": token.subscription_end,
+            "sora2_supported": token.sora2_supported,
+            "sora2_invite_code": token.sora2_invite_code,
+            "sora2_redeemed_count": token.sora2_redeemed_count,
+            "sora2_total_count": token.sora2_total_count,
+            "sora2_remaining_count": token.sora2_remaining_count,
+            "sora2_cooldown_until": token.sora2_cooldown_until,
+            "image_enabled": token.image_enabled,
+            "video_enabled": token.video_enabled,
+            "image_concurrency": token.image_concurrency,
+            "video_concurrency": token.video_concurrency,
+            "browser_provider": token.browser_provider,
+            "browser_profile_id": token.browser_profile_id,
+            "sora_available": token.sora_available,
+            "account_status": token.account_status,
+            "last_auth_refresh_at": token.last_auth_refresh_at,
+            "last_auth_result": token.last_auth_result,
+            "last_auth_error_reason": token.last_auth_error_reason,
+            "last_challenge_reason": token.last_challenge_reason,
+            "last_browser_user_agent": token.last_browser_user_agent,
+            "last_device_id": token.last_device_id,
+            "last_auth_context_hash": token.last_auth_context_hash,
+            "last_auth_context_expires_at": token.last_auth_context_expires_at,
+            "last_auth_page_url": token.last_auth_page_url,
+        }
+
+    async def _rebuild_tokens_table_without_legacy_egress(self, db):
+        cursor = await db.execute("PRAGMA table_info(tokens)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        legacy_columns = [column for column in LEGACY_TOKEN_EGRESS_COLUMNS if column in columns]
+        if not legacy_columns:
+            return
+
+        print(
+            "  -> Rebuilding tokens table to drop legacy token-level egress columns: "
+            + ", ".join(legacy_columns)
+        )
+        await db.commit()
+        await db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            await db.execute("DROP TABLE IF EXISTS tokens__new")
+            await db.execute(self._tokens_table_sql("tokens__new", if_not_exists=False))
+            preserved_columns = ", ".join(TOKEN_TABLE_DATA_COLUMNS)
+            await db.execute(f"""
+                INSERT INTO tokens__new ({preserved_columns})
+                SELECT {preserved_columns} FROM tokens
+            """)
+            await db.execute("DROP TABLE tokens")
+            await db.execute("ALTER TABLE tokens__new RENAME TO tokens")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_token_active ON tokens(is_active)")
+            await db.commit()
+            print("  OK Dropped legacy token-level egress columns from tokens table")
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.execute("PRAGMA foreign_keys = ON")
 
     async def _ensure_config_rows(self, db, config_dict: dict = None):
         """Ensure all config tables have their default rows
@@ -351,10 +578,6 @@ class Database:
                     ("last_challenge_reason", "TEXT"),
                     ("last_browser_user_agent", "TEXT"),
                     ("last_device_id", "TEXT"),
-                    ("last_egress_binding", "TEXT"),
-                    ("last_egress_status", "TEXT"),
-                    ("last_egress_probe_at", "TIMESTAMP"),
-                    ("last_egress_probe_details", "TEXT"),
                     ("last_auth_context_hash", "TEXT"),
                     ("last_auth_context_expires_at", "TIMESTAMP"),
                     ("last_auth_page_url", "TEXT"),
@@ -383,6 +606,8 @@ class Database:
                             )
                     except Exception as e:
                         print(f"  ✗ Failed to backfill token_hash: {e}")
+
+                await self._rebuild_tokens_table_without_legacy_egress(db)
 
             if await self._table_exists(db, "tasks"):
                 task_columns_to_add = [
@@ -647,59 +872,7 @@ class Database:
         """
         async with aiosqlite.connect(self.db_path) as db:
             # Tokens table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS tokens (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token TEXT UNIQUE NOT NULL,
-                    token_hash TEXT,
-                    email TEXT NOT NULL,
-                    username TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    st TEXT,
-                    rt TEXT,
-                    client_id TEXT,
-                    proxy_url TEXT,
-                    remark TEXT,
-                    expiry_time TIMESTAMP,
-                    is_active BOOLEAN DEFAULT 1,
-                    cooled_until TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_used_at TIMESTAMP,
-                    use_count INTEGER DEFAULT 0,
-                    plan_type TEXT,
-                    plan_title TEXT,
-                    subscription_end TIMESTAMP,
-                    sora2_supported BOOLEAN,
-                    sora2_invite_code TEXT,
-                    sora2_redeemed_count INTEGER DEFAULT 0,
-                    sora2_total_count INTEGER DEFAULT 0,
-                    sora2_remaining_count INTEGER DEFAULT 0,
-                    sora2_cooldown_until TIMESTAMP,
-                    image_enabled BOOLEAN DEFAULT 1,
-                    video_enabled BOOLEAN DEFAULT 1,
-                    image_concurrency INTEGER DEFAULT -1,
-                    video_concurrency INTEGER DEFAULT -1,
-                    is_expired BOOLEAN DEFAULT 0,
-                    disabled_reason TEXT,
-                    browser_provider TEXT,
-                    browser_profile_id TEXT,
-                    sora_available BOOLEAN,
-                    account_status TEXT,
-                    last_auth_refresh_at TIMESTAMP,
-                    last_auth_result TEXT,
-                    last_auth_error_reason TEXT,
-                    last_challenge_reason TEXT,
-                    last_browser_user_agent TEXT,
-                    last_device_id TEXT,
-                    last_egress_binding TEXT,
-                    last_egress_status TEXT,
-                    last_egress_probe_at TIMESTAMP,
-                    last_egress_probe_details TEXT,
-                    last_auth_context_hash TEXT,
-                    last_auth_context_expires_at TIMESTAMP,
-                    last_auth_page_url TEXT
-                )
-            """)
+            await db.execute(self._tokens_table_sql())
 
             # Token stats table
             await db.execute("""
@@ -1026,36 +1199,13 @@ class Database:
     async def add_token(self, token: Token) -> int:
         """Add a new token"""
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                INSERT INTO tokens (token, token_hash, email, username, name, st, rt, client_id, proxy_url, remark, expiry_time, is_active,
-                                   plan_type, plan_title, subscription_end, sora2_supported, sora2_invite_code,
-                                   sora2_redeemed_count, sora2_total_count, sora2_remaining_count, sora2_cooldown_until,
-                                   image_enabled, video_enabled, image_concurrency, video_concurrency,
-                                   browser_provider, browser_profile_id, sora_available, account_status,
-                                   last_auth_refresh_at, last_auth_result, last_auth_error_reason,
-                                   last_challenge_reason, last_browser_user_agent, last_device_id,
-                                   last_egress_binding, last_egress_status, last_egress_probe_at, last_egress_probe_details,
-                                   last_auth_context_hash, last_auth_context_expires_at,
-                                   last_auth_page_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                  self._serialize_token_secret(token.token),
-                  secret_codec.hash_secret(token.token),
-                  token.email, "", token.name,
-                  self._serialize_token_secret(token.st), self._serialize_token_secret(token.rt), token.client_id, token.proxy_url,
-                  token.remark, token.expiry_time, token.is_active,
-                  token.plan_type, token.plan_title, token.subscription_end,
-                  token.sora2_supported, token.sora2_invite_code,
-                  token.sora2_redeemed_count, token.sora2_total_count,
-                  token.sora2_remaining_count, token.sora2_cooldown_until,
-                  token.image_enabled, token.video_enabled,
-                  token.image_concurrency, token.video_concurrency,
-                  token.browser_provider, token.browser_profile_id, token.sora_available, token.account_status,
-                  token.last_auth_refresh_at, token.last_auth_result, token.last_auth_error_reason,
-                  token.last_challenge_reason, token.last_browser_user_agent, token.last_device_id,
-                  token.last_egress_binding, token.last_egress_status, token.last_egress_probe_at, token.last_egress_probe_details,
-                  token.last_auth_context_hash, token.last_auth_context_expires_at,
-                  token.last_auth_page_url))
+            payload = self._build_token_insert_payload(token)
+            columns_sql = ", ".join(TOKEN_INSERT_COLUMNS)
+            placeholders = ", ".join("?" for _ in TOKEN_INSERT_COLUMNS)
+            cursor = await db.execute(f"""
+                INSERT INTO tokens ({columns_sql})
+                VALUES ({placeholders})
+            """, tuple(payload[column] for column in TOKEN_INSERT_COLUMNS))
             await db.commit()
             token_id = cursor.lastrowid
 
@@ -1243,10 +1393,6 @@ class Database:
                           last_challenge_reason: Optional[str] = None,
                           last_browser_user_agent: Optional[str] = None,
                           last_device_id: Optional[str] = None,
-                          last_egress_binding: Optional[str] = None,
-                          last_egress_status: Optional[str] = None,
-                          last_egress_probe_at: Optional[datetime] = None,
-                          last_egress_probe_details: Optional[str] = None,
                           last_auth_context_hash: Optional[str] = None,
                           last_auth_context_expires_at: Optional[datetime] = None,
                           last_auth_page_url: Optional[str] = None):
@@ -1353,22 +1499,6 @@ class Database:
             if last_device_id is not None:
                 updates.append("last_device_id = ?")
                 params.append(last_device_id)
-
-            if last_egress_binding is not None:
-                updates.append("last_egress_binding = ?")
-                params.append(last_egress_binding)
-
-            if last_egress_status is not None:
-                updates.append("last_egress_status = ?")
-                params.append(last_egress_status)
-
-            if last_egress_probe_at is not None:
-                updates.append("last_egress_probe_at = ?")
-                params.append(last_egress_probe_at)
-
-            if last_egress_probe_details is not None:
-                updates.append("last_egress_probe_details = ?")
-                params.append(last_egress_probe_details)
 
             if last_auth_context_hash is not None:
                 updates.append("last_auth_context_hash = ?")
@@ -1744,10 +1874,6 @@ class Database:
         last_challenge_reason: Optional[str] = None,
         last_browser_user_agent: Optional[str] = None,
         last_device_id: Optional[str] = None,
-        last_egress_binding: Optional[str] = None,
-        last_egress_status: Optional[str] = None,
-        last_egress_probe_at: Optional[datetime] = None,
-        last_egress_probe_details: Optional[str] = None,
         last_auth_context_hash: Optional[str] = None,
         last_auth_context_expires_at: Optional[datetime] = None,
         last_auth_page_url: Optional[str] = None,
@@ -1765,10 +1891,6 @@ class Database:
             last_challenge_reason=last_challenge_reason,
             last_browser_user_agent=last_browser_user_agent,
             last_device_id=last_device_id,
-            last_egress_binding=last_egress_binding,
-            last_egress_status=last_egress_status,
-            last_egress_probe_at=last_egress_probe_at,
-            last_egress_probe_details=last_egress_probe_details,
             last_auth_context_hash=last_auth_context_hash,
             last_auth_context_expires_at=last_auth_context_expires_at,
             last_auth_page_url=last_auth_page_url,

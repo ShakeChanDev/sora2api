@@ -54,10 +54,6 @@ class Token(BaseModel):
     last_challenge_reason: Optional[str] = None
     last_browser_user_agent: Optional[str] = None
     last_device_id: Optional[str] = None
-    last_egress_binding: Optional[str] = None
-    last_egress_status: Optional[str] = None
-    last_egress_probe_at: Optional[datetime] = None
-    last_egress_probe_details: Optional[str] = None
     last_auth_context_hash: Optional[str] = None
     last_auth_context_expires_at: Optional[datetime] = None
     last_auth_page_url: Optional[str] = None
