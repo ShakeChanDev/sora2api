@@ -34,7 +34,6 @@ class DatabaseBrowserStateTests(unittest.TestCase):
                 browser_profile_id="profile-1",
                 account_status="ready",
                 last_auth_result="success",
-                last_egress_binding="binding-1",
             )
             attempt_id = await self.db.create_mutation_attempt(
                 token_id=token_id,
@@ -114,6 +113,131 @@ class DatabaseBrowserStateTests(unittest.TestCase):
         self.assertEqual(task.current_stage, "completed")
         self.assertEqual(task.auth_snapshot_id, "auth-1")
         self.assertIn('"profile_id":"profile-1"', task.polling_context)
+
+    def test_legacy_token_egress_columns_are_removed_during_migration(self):
+        fd, legacy_db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        legacy_db = Database(legacy_db_path)
+        try:
+            asyncio.run(legacy_db.init_db({}))
+
+            async def scenario():
+                async with aiosqlite.connect(legacy_db_path) as raw_db:
+                    await raw_db.execute("PRAGMA foreign_keys = OFF")
+                    await raw_db.execute("DROP TABLE IF EXISTS tokens")
+                    await raw_db.execute("""
+                        CREATE TABLE tokens (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            token TEXT UNIQUE NOT NULL,
+                            token_hash TEXT,
+                            email TEXT NOT NULL,
+                            username TEXT NOT NULL,
+                            name TEXT NOT NULL,
+                            st TEXT,
+                            rt TEXT,
+                            client_id TEXT,
+                            proxy_url TEXT,
+                            remark TEXT,
+                            expiry_time TIMESTAMP,
+                            is_active BOOLEAN DEFAULT 1,
+                            cooled_until TIMESTAMP,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_used_at TIMESTAMP,
+                            use_count INTEGER DEFAULT 0,
+                            plan_type TEXT,
+                            plan_title TEXT,
+                            subscription_end TIMESTAMP,
+                            sora2_supported BOOLEAN,
+                            sora2_invite_code TEXT,
+                            sora2_redeemed_count INTEGER DEFAULT 0,
+                            sora2_total_count INTEGER DEFAULT 0,
+                            sora2_remaining_count INTEGER DEFAULT 0,
+                            sora2_cooldown_until TIMESTAMP,
+                            image_enabled BOOLEAN DEFAULT 1,
+                            video_enabled BOOLEAN DEFAULT 1,
+                            image_concurrency INTEGER DEFAULT -1,
+                            video_concurrency INTEGER DEFAULT -1,
+                            is_expired BOOLEAN DEFAULT 0,
+                            disabled_reason TEXT,
+                            browser_provider TEXT,
+                            browser_profile_id TEXT,
+                            sora_available BOOLEAN,
+                            account_status TEXT,
+                            last_auth_refresh_at TIMESTAMP,
+                            last_auth_result TEXT,
+                            last_auth_error_reason TEXT,
+                            last_challenge_reason TEXT,
+                            last_browser_user_agent TEXT,
+                            last_device_id TEXT,
+                            last_egress_binding TEXT,
+                            last_egress_status TEXT,
+                            last_egress_probe_at TIMESTAMP,
+                            last_egress_probe_details TEXT,
+                            last_auth_page_url TEXT
+                        )
+                    """)
+                    await raw_db.execute("""
+                        INSERT INTO tokens (
+                            id, token, token_hash, email, username, name, proxy_url,
+                            browser_provider, browser_profile_id, account_status,
+                            last_auth_result, last_auth_page_url,
+                            last_egress_binding, last_egress_status
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        1,
+                        secret_codec.encrypt("tok"),
+                        secret_codec.hash_secret("tok"),
+                        "user@example.com",
+                        "legacy-user",
+                        "Legacy User",
+                        "http://proxy:8080",
+                        "nst",
+                        "profile-1",
+                        "ready",
+                        "success",
+                        "https://sora.chatgpt.com/drafts",
+                        "binding-1",
+                        "proven",
+                    ))
+                    await raw_db.commit()
+
+                await legacy_db.check_and_migrate_db({})
+
+                async with aiosqlite.connect(legacy_db_path) as raw_db:
+                    columns_cursor = await raw_db.execute("PRAGMA table_info(tokens)")
+                    columns = [row[1] for row in await columns_cursor.fetchall()]
+                    token_cursor = await raw_db.execute("""
+                        SELECT proxy_url, browser_provider, browser_profile_id, last_auth_result, last_auth_page_url
+                        FROM tokens
+                        WHERE id = 1
+                    """)
+                    token_row = await token_cursor.fetchone()
+
+                token = await legacy_db.get_token(1)
+                return columns, token_row, token
+
+            columns, token_row, token = asyncio.run(scenario())
+            self.assertNotIn("last_egress_binding", columns)
+            self.assertNotIn("last_egress_status", columns)
+            self.assertNotIn("last_egress_probe_at", columns)
+            self.assertNotIn("last_egress_probe_details", columns)
+            self.assertIn("last_auth_context_hash", columns)
+            self.assertIn("last_auth_context_expires_at", columns)
+            self.assertEqual(token_row[0], "http://proxy:8080")
+            self.assertEqual(token_row[1], "nst")
+            self.assertEqual(token_row[2], "profile-1")
+            self.assertEqual(token_row[3], "success")
+            self.assertEqual(token_row[4], "https://sora.chatgpt.com/drafts")
+            self.assertEqual(token.token, "tok")
+            self.assertEqual(token.browser_provider, "nst")
+            self.assertEqual(token.browser_profile_id, "profile-1")
+            self.assertEqual(token.account_status, "ready")
+            self.assertEqual(token.last_auth_result, "success")
+            self.assertEqual(token.last_auth_page_url, "https://sora.chatgpt.com/drafts")
+        finally:
+            if os.path.exists(legacy_db_path):
+                os.unlink(legacy_db_path)
 
     def test_recent_logs_collapse_to_primary_task_record(self):
         async def scenario():
