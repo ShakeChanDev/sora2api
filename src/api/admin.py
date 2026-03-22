@@ -319,6 +319,32 @@ async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
 
     return result
 
+@router.get("/api/tokens/{token_id}")
+async def get_token_detail(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+) -> dict:
+    """Get a single token with plaintext fields for editing."""
+    token_data = await db.get_token(token_id)
+    if not token_data:
+        raise HTTPException(status_code=404, detail="Token not found")
+
+    return {
+        "id": token_data.id,
+        "token": token_data.token,
+        "st": token_data.st,
+        "rt": token_data.rt,
+        "client_id": token_data.client_id,
+        "proxy_url": token_data.proxy_url,
+        "remark": token_data.remark,
+        "image_enabled": token_data.image_enabled,
+        "video_enabled": token_data.video_enabled,
+        "image_concurrency": token_data.image_concurrency,
+        "video_concurrency": token_data.video_concurrency,
+        "browser_provider": token_data.browser_provider,
+        "browser_profile_id": token_data.browser_profile_id,
+    }
+
 @router.post("/api/tokens")
 async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_token)):
     """Add a new Access Token"""
