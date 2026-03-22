@@ -12,6 +12,7 @@ class _FakeDb:
         self._active_tokens = active_tokens
         self._token_by_id = token_by_id
         self.browser_state_updates = []
+        self.task_events = []
 
     async def get_active_tokens(self):
         return list(self._active_tokens)
@@ -25,13 +26,52 @@ class _FakeDb:
     async def update_token_browser_state(self, token_id, **kwargs):
         self.browser_state_updates.append((token_id, kwargs))
 
+    async def create_task_event(self, **kwargs):
+        self.task_events.append(kwargs)
+
 
 class _FakeProvider:
     provider_name = "nst"
 
 
+class _CleanupProvider:
+    provider_name = "nst"
+
+    def __init__(self):
+        self.stop_calls = []
+
+    async def stop(self, profile_id):
+        self.stop_calls.append(profile_id)
+        return {"ok": True}
+
+
+class _FakeRuntime:
+    def __init__(self):
+        self.immediate_stops = []
+        self.scheduled_stops = []
+
+    async def stop_profile_now(self, profile_id, stop_action):
+        self.immediate_stops.append(profile_id)
+        await stop_action()
+        return True
+
+    async def schedule_profile_stop(self, profile_id, delay_seconds, stop_action):
+        self.scheduled_stops.append((profile_id, delay_seconds))
+        return None
+
+
 class MutationExecutorPolicyTests(unittest.TestCase):
     """Verify conservative mutation policy gates."""
+
+    def setUp(self):
+        from src.core.config import config
+
+        self._browser_config = dict(config._config.get("browser", {}))
+
+    def tearDown(self):
+        from src.core.config import config
+
+        config._config["browser"] = self._browser_config
 
     def test_duplicate_profile_binding_is_rejected(self):
         async def scenario():
@@ -43,6 +83,83 @@ class MutationExecutorPolicyTests(unittest.TestCase):
                 await executor._resolve_profile(1)
             self.assertEqual(ctx.exception.code, "duplicate_profile_binding")
             self.assertTrue(any(update[1].get("account_status") == "duplicate_profile_binding" for update in db.browser_state_updates))
+
+        asyncio.run(scenario())
+
+    def test_successful_browser_flow_closes_window_immediately_when_auto_close_enabled(self):
+        async def scenario():
+            from src.core.config import config
+
+            config._config.setdefault("browser", {})["window_policy"] = "auto_close"
+            provider = _CleanupProvider()
+            runtime = _FakeRuntime()
+            db = _FakeDb([], {})
+            executor = MutationExecutor(db, provider, runtime=runtime, proxy_manager=None)
+
+            await executor._apply_window_cleanup_policy("profile-1", 1, "task-1", "success")
+
+            self.assertEqual(runtime.immediate_stops, ["profile-1"])
+            self.assertEqual(runtime.scheduled_stops, [])
+            self.assertEqual(provider.stop_calls, ["profile-1"])
+            self.assertEqual(db.task_events[0]["event_type"], "browser_window_closed")
+
+        asyncio.run(scenario())
+
+    def test_human_intervention_failure_retains_window_temporarily(self):
+        async def scenario():
+            from src.core.config import config
+
+            config._config.setdefault("browser", {})["window_policy"] = "auto_close"
+            config._config.setdefault("browser", {})["failure_retention_seconds"] = 900
+            provider = _CleanupProvider()
+            runtime = _FakeRuntime()
+            db = _FakeDb([], {})
+            executor = MutationExecutor(db, provider, runtime=runtime, proxy_manager=None)
+
+            await executor._apply_window_cleanup_policy("profile-2", 2, "task-2", "error", error_code="cloudflare_challenge")
+
+            self.assertEqual(runtime.immediate_stops, [])
+            self.assertEqual(runtime.scheduled_stops, [("profile-2", 900)])
+            self.assertEqual(provider.stop_calls, [])
+            self.assertEqual(db.task_events[0]["event_type"], "browser_window_retained")
+
+        asyncio.run(scenario())
+
+    def test_non_intervention_failure_closes_window_immediately(self):
+        async def scenario():
+            from src.core.config import config
+
+            config._config.setdefault("browser", {})["window_policy"] = "auto_close"
+            provider = _CleanupProvider()
+            runtime = _FakeRuntime()
+            db = _FakeDb([], {})
+            executor = MutationExecutor(db, provider, runtime=runtime, proxy_manager=None)
+
+            await executor._apply_window_cleanup_policy("profile-3", 3, "task-3", "error", error_code="page_execute_failed")
+
+            self.assertEqual(runtime.immediate_stops, ["profile-3"])
+            self.assertEqual(runtime.scheduled_stops, [])
+            self.assertEqual(provider.stop_calls, ["profile-3"])
+            self.assertEqual(db.task_events[0]["event_type"], "browser_window_closed")
+
+        asyncio.run(scenario())
+
+    def test_persistent_window_policy_keeps_existing_behavior(self):
+        async def scenario():
+            from src.core.config import config
+
+            config._config.setdefault("browser", {})["window_policy"] = "persistent"
+            provider = _CleanupProvider()
+            runtime = _FakeRuntime()
+            db = _FakeDb([], {})
+            executor = MutationExecutor(db, provider, runtime=runtime, proxy_manager=None)
+
+            await executor._apply_window_cleanup_policy("profile-4", 4, "task-4", "success")
+
+            self.assertEqual(runtime.immediate_stops, [])
+            self.assertEqual(runtime.scheduled_stops, [])
+            self.assertEqual(provider.stop_calls, [])
+            self.assertEqual(db.task_events, [])
 
         asyncio.run(scenario())
 

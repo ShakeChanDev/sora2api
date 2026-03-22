@@ -94,7 +94,10 @@ class NSTBrowserProvider(BrowserProvider):
         raise BrowserProviderError("browser_provider_http_error", f"Failed to start NSTBrowser profile {profile_id}")
 
     async def stop(self, profile_id: str) -> Dict[str, Any]:
-        return await self._request("POST", f"/browsers/{profile_id}/stop")
+        try:
+            return await self._request("DELETE", f"/browsers/{profile_id}")
+        except BrowserProviderError:
+            return await self._request("POST", f"/browsers/{profile_id}/stop")
 
     async def _resolve_debugger(self, profile_id: str) -> Dict[str, Any]:
         debugger = await self._request_debugger(profile_id)

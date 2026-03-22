@@ -86,6 +86,8 @@ page_timeout_ms = 45000
 readiness_timeout_ms = 20000
 auth_max_age_seconds = 120
 enforce_token_profile_binding = true
+window_policy = "auto_close"
+failure_retention_seconds = 900
 
 [nst_browser]
 base_url = "http://127.0.0.1:8848/api/v2"

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from ..core.config import config
@@ -53,6 +54,12 @@ POLICIES: Dict[str, MutationPolicy] = {
 
 RECOVERABLE_BROWSER_CODES = {"TARGET_CLOSED", "ECONNREFUSED", "execution_context_destroyed"}
 REPLAY_ALLOWLIST: set[str] = set()
+HUMAN_INTERVENTION_BROWSER_CODES = {
+    "cloudflare_challenge",
+    "auth_context_invalid",
+    "auth_context_incomplete",
+    "sentinel_not_ready",
+}
 
 
 class MutationExecutor:
@@ -92,6 +99,8 @@ class MutationExecutor:
         details: Optional[dict] = None,
         error_code: Optional[str] = None,
     ):
+        if not task_id:
+            return
         payload = json.dumps(details, ensure_ascii=False) if details is not None else None
         await self.db.create_task_event(
             task_id=task_id,
@@ -103,6 +112,85 @@ class MutationExecutor:
             details=payload,
             error_code=error_code,
             error_reason=message if error_code else None,
+        )
+
+    def _window_auto_close_enabled(self) -> bool:
+        return bool(self.provider) and config.browser_window_policy == "auto_close"
+
+    async def _apply_window_cleanup_policy(
+        self,
+        profile_id: str,
+        token_id: Optional[int],
+        task_id: Optional[str],
+        outcome: str,
+        error_code: Optional[str] = None,
+    ):
+        if not self._window_auto_close_enabled() or not self.provider:
+            return
+
+        if outcome == "success":
+            stopped = await self.runtime.stop_profile_now(profile_id, lambda: self.provider.stop(profile_id))
+            status = "success" if stopped else "error"
+            message = (
+                f"browser profile {profile_id} closed immediately after successful browser flow"
+                if stopped
+                else f"browser profile {profile_id} failed to close after successful browser flow"
+            )
+            debug_logger.log_info(f"[MutationExecutor] {message}")
+            await self._record_task_event(
+                task_id,
+                token_id,
+                "browser_window_closed",
+                "window_cleanup",
+                status,
+                message,
+                {"profile_id": profile_id, "reason": "success"},
+                error_code=None if stopped else "browser_window_close_failed",
+            )
+            return
+
+        if error_code in HUMAN_INTERVENTION_BROWSER_CODES and config.browser_failure_retention_seconds > 0:
+            retention_seconds = config.browser_failure_retention_seconds
+            close_at = datetime.now().astimezone() + timedelta(seconds=retention_seconds)
+            await self.runtime.schedule_profile_stop(profile_id, retention_seconds, lambda: self.provider.stop(profile_id))
+            message = (
+                f"browser profile {profile_id} retained for manual intervention after {error_code}; "
+                f"scheduled close at {close_at.isoformat(timespec='seconds')}"
+            )
+            debug_logger.log_info(f"[MutationExecutor] {message}")
+            await self._record_task_event(
+                task_id,
+                token_id,
+                "browser_window_retained",
+                "window_cleanup",
+                "running",
+                message,
+                {
+                    "profile_id": profile_id,
+                    "error_code": error_code,
+                    "retention_seconds": retention_seconds,
+                    "scheduled_close_at": close_at.isoformat(timespec="seconds"),
+                },
+            )
+            return
+
+        stopped = await self.runtime.stop_profile_now(profile_id, lambda: self.provider.stop(profile_id))
+        status = "success" if stopped else "error"
+        message = (
+            f"browser profile {profile_id} closed immediately after browser failure"
+            if stopped
+            else f"browser profile {profile_id} failed to close after browser failure"
+        )
+        debug_logger.log_info(f"[MutationExecutor] {message} error_code={error_code or 'unknown'}")
+        await self._record_task_event(
+            task_id,
+            token_id,
+            "browser_window_closed",
+            "window_cleanup",
+            status,
+            message,
+            {"profile_id": profile_id, "reason": "failure", "error_code": error_code},
+            error_code=None if stopped else "browser_window_close_failed",
         )
 
     async def _record_failure(
@@ -279,6 +367,8 @@ class MutationExecutor:
         async with self.runtime.profile_lock(profile_id):
             while True:
                 connection = None
+                cleanup_outcome: Optional[str] = None
+                cleanup_error_code: Optional[str] = None
                 try:
                     async with self.runtime.startup_queue():
                         connection = await self.provider.connect_profile(profile_id, preferred_url=preferred_url)
@@ -297,17 +387,29 @@ class MutationExecutor:
                                 "polling auth context refreshed",
                                 {"profile_id": profile_id, "page_url": auth_context.page_url},
                             )
+                        cleanup_outcome = "success"
                         return auth_context
                 except BrowserProviderError as exc:
                     if exc.code in RECOVERABLE_BROWSER_CODES and not recovered:
                         recovered = True
                         if connection:
                             await self.provider.disconnect(connection)
+                            connection = None
                         continue
+                    cleanup_outcome = "error"
+                    cleanup_error_code = exc.code
                     raise
                 finally:
                     if connection:
                         await self.provider.disconnect(connection)
+                    if cleanup_outcome:
+                        await self._apply_window_cleanup_policy(
+                            profile_id=profile_id,
+                            token_id=token_id,
+                            task_id=task_id,
+                            outcome=cleanup_outcome,
+                            error_code=cleanup_error_code,
+                        )
 
     async def _run_page_plan(
         self,
@@ -340,6 +442,9 @@ class MutationExecutor:
         async with self.runtime.profile_lock(profile_id):
             while True:
                 connection = None
+                cleanup_outcome: Optional[str] = None
+                cleanup_error_code: Optional[str] = None
+                cleanup_task_id = task_id
                 try:
                     async with self.runtime.startup_queue():
                         await self.db.update_mutation_attempt(attempt_id, stage="startup", status="running")
@@ -380,6 +485,8 @@ class MutationExecutor:
                             status="succeeded",
                             details=json.dumps({"status": last_response.status, "request_count": len(request_plan)}, ensure_ascii=False),
                         )
+                        cleanup_outcome = "success"
+                        cleanup_task_id = derived_task_id
                         return MutationResult(
                             task_id=derived_task_id,
                             polling_context=auth_context.to_polling_context(),
@@ -402,11 +509,22 @@ class MutationExecutor:
                         await self._record_task_event(task_id, token_id, "reconnect", "reconnect", "running", f"Recovering browser profile after {exc.code}", {"profile_id": profile_id})
                         if connection:
                             await self.provider.disconnect(connection)
+                            connection = None
                         continue
+                    cleanup_outcome = "error"
+                    cleanup_error_code = exc.code
                     raise
                 finally:
                     if connection:
                         await self.provider.disconnect(connection)
+                    if cleanup_outcome:
+                        await self._apply_window_cleanup_policy(
+                            profile_id=profile_id,
+                            token_id=token_id,
+                            task_id=cleanup_task_id,
+                            outcome=cleanup_outcome,
+                            error_code=cleanup_error_code,
+                        )
 
     async def execute_video_submit(self, prompt: str, token_id: Optional[int], orientation: str, n_frames: int, model: str, size: str, media_id: Optional[str] = None, style_id: Optional[str] = None) -> MutationResult:
         await self.ensure_video_token_binding(token_id)

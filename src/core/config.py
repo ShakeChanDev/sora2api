@@ -392,6 +392,21 @@ class Config:
         return bool(self._config.get("browser", {}).get("enforce_token_profile_binding", True))
 
     @property
+    def browser_window_policy(self) -> str:
+        """Window lifecycle policy for NST browser profiles."""
+        policy = str(self._config.get("browser", {}).get("window_policy", "persistent")).strip().lower()
+        return policy if policy in {"auto_close", "persistent"} else "persistent"
+
+    @property
+    def browser_failure_retention_seconds(self) -> int:
+        """How long to keep a failed browser window open for manual intervention."""
+        raw = self._config.get("browser", {}).get("failure_retention_seconds", 900)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 900
+
+    @property
     def nst_browser_base_url(self) -> str:
         """NSTBrowser local API base URL."""
         return self._config.get("nst_browser", {}).get("base_url", "http://127.0.0.1:8848/api/v2")
