@@ -158,6 +158,49 @@ class MutationExecutor:
             f"mutation={mutation_type} index={index} task={task_id or '-'} status={status_code} duration={duration:.2f}s"
         )
 
+    async def _cleanup_profile(
+        self,
+        profile_id: str,
+        connection,
+        task_id: Optional[str] = None,
+        token_id: Optional[int] = None,
+    ):
+        if connection and self.provider:
+            try:
+                await self.provider.disconnect(connection)
+            except Exception as exc:
+                debug_logger.log_warning(f"[MutationExecutor] disconnect failed for profile {profile_id}: {exc}")
+                if task_id:
+                    await self._record_task_event(
+                        task_id,
+                        token_id,
+                        "browser_disconnect_failed",
+                        "cleanup",
+                        "error",
+                        f"browser disconnect failed: {exc}",
+                        {"profile_id": profile_id},
+                        error_code="browser_disconnect_failed",
+                    )
+
+        if not self.provider:
+            return
+
+        try:
+            await self.provider.stop(profile_id)
+        except Exception as exc:
+            debug_logger.log_warning(f"[MutationExecutor] stop failed for profile {profile_id}: {exc}")
+            if task_id:
+                await self._record_task_event(
+                    task_id,
+                    token_id,
+                    "browser_stop_failed",
+                    "cleanup",
+                    "error",
+                    f"browser stop failed: {exc}",
+                    {"profile_id": profile_id},
+                    error_code="browser_stop_failed",
+                )
+
     async def ensure_video_token_binding(self, token_id: Optional[int]):
         token_obj = await self.db.get_token(token_id) if token_id else None
         provider_name = (
@@ -301,13 +344,10 @@ class MutationExecutor:
                 except BrowserProviderError as exc:
                     if exc.code in RECOVERABLE_BROWSER_CODES and not recovered:
                         recovered = True
-                        if connection:
-                            await self.provider.disconnect(connection)
                         continue
                     raise
                 finally:
-                    if connection:
-                        await self.provider.disconnect(connection)
+                    await self._cleanup_profile(profile_id, connection, task_id=task_id, token_id=token_id)
 
     async def _run_page_plan(
         self,
@@ -336,6 +376,7 @@ class MutationExecutor:
         )
         await self._record_task_event(task_id, token_id, "mutation_attempt", "queued", "started", f"{mutation_type} queued", {"profile_id": profile_id})
         last_response = None
+        cleanup_task_id = task_id
         recovered = False
         async with self.runtime.profile_lock(profile_id):
             while True:
@@ -373,6 +414,7 @@ class MutationExecutor:
                             await self._record_task_event(task_id, token_id, "mutation_submit", "mutation_submit", "success", f"{request.method} {request.url} completed", {"index": index, "status": last_response.status})
                         response_data = last_response.data or {}
                         derived_task_id = response_data.get("id") or task_id
+                        cleanup_task_id = derived_task_id
                         await self.db.update_mutation_attempt(
                             attempt_id,
                             task_id=derived_task_id,
@@ -400,13 +442,10 @@ class MutationExecutor:
                     if exc.code in RECOVERABLE_BROWSER_CODES and not recovered:
                         recovered = True
                         await self._record_task_event(task_id, token_id, "reconnect", "reconnect", "running", f"Recovering browser profile after {exc.code}", {"profile_id": profile_id})
-                        if connection:
-                            await self.provider.disconnect(connection)
                         continue
                     raise
                 finally:
-                    if connection:
-                        await self.provider.disconnect(connection)
+                    await self._cleanup_profile(profile_id, connection, task_id=cleanup_task_id, token_id=token_id)
 
     async def execute_video_submit(self, prompt: str, token_id: Optional[int], orientation: str, n_frames: int, model: str, size: str, media_id: Optional[str] = None, style_id: Optional[str] = None) -> MutationResult:
         await self.ensure_video_token_binding(token_id)

@@ -67,6 +67,40 @@ class NSTBrowserProviderTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_stop_prefers_delete_endpoint(self):
+        async def scenario():
+            provider = _FakeNSTBrowserProvider([
+                ("DELETE", "/browsers/profile-3", {"profileId": "profile-3"}),
+            ])
+            result = await provider.stop("profile-3")
+            self.assertEqual(result["profileId"], "profile-3")
+            self.assertEqual(
+                provider.calls,
+                [
+                    ("DELETE", "/browsers/profile-3"),
+                ],
+            )
+
+        asyncio.run(scenario())
+
+    def test_stop_falls_back_to_legacy_stop_endpoint(self):
+        async def scenario():
+            provider = _FakeNSTBrowserProvider([
+                ("DELETE", "/browsers/profile-4", BrowserProviderError("browser_provider_http_error", "404")),
+                ("POST", "/browsers/profile-4/stop", {"profileId": "profile-4"}),
+            ])
+            result = await provider.stop("profile-4")
+            self.assertEqual(result["profileId"], "profile-4")
+            self.assertEqual(
+                provider.calls,
+                [
+                    ("DELETE", "/browsers/profile-4"),
+                    ("POST", "/browsers/profile-4/stop"),
+                ],
+            )
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()
