@@ -12,6 +12,7 @@
 ## 导入文档
 
 - [api-docs 导入说明](./imported/api-docs/README.md)
+- [VidenX Backend 视频供应商链路参考](./imported/videnx-backend/README.md)
 
 ## 说明
 
