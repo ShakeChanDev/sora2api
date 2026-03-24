@@ -165,6 +165,7 @@ class AdminConfig(BaseModel):
     admin_username: str  # Read from database, initialized from setting.toml on first startup
     admin_password: str  # Read from database, initialized from setting.toml on first startup
     api_key: str  # Read from database, initialized from setting.toml on first startup
+    nst_browser_api_key: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
     error_ban_threshold: int = 3
     task_retry_enabled: bool = True  # 是否启用任务失败重试
     task_max_retries: int = 3  # 任务最大重试次数

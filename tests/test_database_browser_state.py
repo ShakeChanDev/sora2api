@@ -5,7 +5,7 @@ import tempfile
 import unittest
 import aiosqlite
 
-from src.core.database import Database
+from src.core.database import DEFAULT_NST_BROWSER_API_KEY, Database
 from src.core.models import RequestLog, Task, Token
 from src.core.secret_codec import secret_codec
 
@@ -291,6 +291,73 @@ class DatabaseBrowserStateTests(unittest.TestCase):
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0]["id"], primary_log_id)
         self.assertEqual(logs[0]["operation"], "generate_video")
+
+    def test_admin_config_persists_nst_browser_api_key(self):
+        async def scenario():
+            await self.db.init_config_from_toml({})
+            admin_config = await self.db.get_admin_config()
+            default_key = admin_config.nst_browser_api_key
+            admin_config.nst_browser_api_key = "updated-nst-key"
+            await self.db.update_admin_config(admin_config)
+            updated_config = await self.db.get_admin_config()
+            return default_key, updated_config
+
+        default_key, updated_config = asyncio.run(scenario())
+        self.assertEqual(default_key, DEFAULT_NST_BROWSER_API_KEY)
+        self.assertEqual(updated_config.nst_browser_api_key, "updated-nst-key")
+
+    def test_admin_config_migration_backfills_nst_browser_api_key(self):
+        fd, legacy_db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        legacy_db = Database(legacy_db_path)
+        try:
+            asyncio.run(legacy_db.init_db({}))
+
+            async def scenario():
+                async with aiosqlite.connect(legacy_db_path) as raw_db:
+                    await raw_db.execute("DROP TABLE IF EXISTS admin_config")
+                    await raw_db.execute("""
+                        CREATE TABLE admin_config (
+                            id INTEGER PRIMARY KEY DEFAULT 1,
+                            admin_username TEXT DEFAULT 'admin',
+                            admin_password TEXT DEFAULT 'admin',
+                            api_key TEXT DEFAULT 'han1234',
+                            error_ban_threshold INTEGER DEFAULT 3,
+                            task_retry_enabled BOOLEAN DEFAULT 1,
+                            task_max_retries INTEGER DEFAULT 3,
+                            auto_disable_on_401 BOOLEAN DEFAULT 1,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    await raw_db.execute("""
+                        INSERT INTO admin_config (
+                            id, admin_username, admin_password, api_key,
+                            error_ban_threshold, task_retry_enabled, task_max_retries, auto_disable_on_401
+                        )
+                        VALUES (1, 'admin', 'admin', 'han1234', 3, 1, 3, 1)
+                    """)
+                    await raw_db.commit()
+
+                await legacy_db.check_and_migrate_db({})
+
+                async with aiosqlite.connect(legacy_db_path) as raw_db:
+                    columns_cursor = await raw_db.execute("PRAGMA table_info(admin_config)")
+                    columns = [row[1] for row in await columns_cursor.fetchall()]
+                    value_cursor = await raw_db.execute(
+                        "SELECT nst_browser_api_key FROM admin_config WHERE id = 1"
+                    )
+                    value_row = await value_cursor.fetchone()
+
+                admin_config = await legacy_db.get_admin_config()
+                return columns, value_row[0], admin_config
+
+            columns, stored_key, admin_config = asyncio.run(scenario())
+            self.assertIn("nst_browser_api_key", columns)
+            self.assertEqual(stored_key, DEFAULT_NST_BROWSER_API_KEY)
+            self.assertEqual(admin_config.nst_browser_api_key, DEFAULT_NST_BROWSER_API_KEY)
+        finally:
+            if os.path.exists(legacy_db_path):
+                os.unlink(legacy_db_path)
 
 
 if __name__ == "__main__":

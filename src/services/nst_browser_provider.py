@@ -33,15 +33,16 @@ class NSTBrowserProvider(BrowserProvider):
 
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
         self.base_url = (base_url or config.nst_browser_base_url).rstrip("/")
-        self.api_key = api_key or config.nst_browser_api_key
+        self._api_key_override = api_key
         self.page_timeout_ms = config.browser_page_timeout_ms
         self.readiness_timeout_ms = config.browser_readiness_timeout_ms
 
     @property
     def _headers(self) -> Dict[str, str]:
         headers: Dict[str, str] = {}
-        if self.api_key:
-            headers["x-api-key"] = self.api_key
+        api_key = self._api_key_override if self._api_key_override is not None else config.nst_browser_api_key
+        if api_key:
+            headers["x-api-key"] = api_key
         return headers
 
     async def _request(self, method: str, path: str, json_data: Optional[dict] = None) -> Dict[str, Any]:

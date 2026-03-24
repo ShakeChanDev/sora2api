@@ -91,5 +91,5 @@ failure_retention_seconds = 900
 
 [nst_browser]
 base_url = "http://127.0.0.1:8848/api/v2"
-api_key = ""
+api_key = "fa7f8e88-1682-4075-9cfd-f54c9a240273"
 

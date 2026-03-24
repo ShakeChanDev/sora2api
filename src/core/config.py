@@ -413,8 +413,14 @@ class Config:
 
     @property
     def nst_browser_api_key(self) -> str:
-        """NSTBrowser local API key. Env-only to avoid committed secrets."""
-        return os.getenv("NST_BROWSER_API_KEY", "")
+        """NSTBrowser local API key."""
+        return self._config.get("nst_browser", {}).get("api_key", "")
+
+    @nst_browser_api_key.setter
+    def nst_browser_api_key(self, value: str):
+        if "nst_browser" not in self._config:
+            self._config["nst_browser"] = {}
+        self._config["nst_browser"]["api_key"] = value
 
     @property
     def secret_key(self) -> str:

@@ -22,9 +22,19 @@ from ..core.logger import debug_logger
 # Custom exception to carry token_id information
 class GenerationError(Exception):
     """Custom exception for generation errors that includes token_id"""
-    def __init__(self, message: str, token_id: Optional[int] = None):
+    def __init__(
+        self,
+        message: str,
+        token_id: Optional[int] = None,
+        retry_allowed: bool = True,
+        task_id: Optional[str] = None,
+        task_submitted: bool = False,
+    ):
         super().__init__(message)
         self.token_id = token_id
+        self.retry_allowed = retry_allowed
+        self.task_id = task_id
+        self.task_submitted = task_submitted
 
 # Model configuration
 MODEL_CONFIG = {
@@ -661,6 +671,7 @@ class GenerationHandler:
                 raise Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
 
         task_id = None
+        task_submitted = False
         is_first_chunk = True  # Track if this is the first chunk
         log_id = None  # Initialize log_id
         log_updated = False  # Track if log has been updated
@@ -766,6 +777,7 @@ class GenerationHandler:
                     token_id=token_obj.id
                 )
                 submission = None
+            task_submitted = task_id is not None
 
             # Save task to database
             task = Task(
@@ -799,6 +811,7 @@ class GenerationHandler:
                 log_id,
                 start_time,
                 polling_context=submission.polling_context if submission else None,
+                request_log_success_payload={"model": model},
             ):
                 yield chunk
             
@@ -837,13 +850,14 @@ class GenerationHandler:
                     response_data["result_urls"] = task_info.result_urls
 
             # Update log entry with completion data
-            if log_id:
+            if log_id and not await self._is_request_log_finalized(log_id):
                 await self.db.update_request_log(
                     log_id,
                     response_body=json.dumps(response_data),
                     status_code=200,
                     duration=duration
                 )
+            if log_id:
                 log_updated = True  # Mark log as updated
 
         except Exception as e:
@@ -883,7 +897,9 @@ class GenerationHandler:
             # Update log entry with error data
             duration = time.time() - start_time
             if log_id:
-                if error_response:
+                if await self._is_request_log_finalized(log_id):
+                    log_updated = True
+                elif error_response:
                     # Structured error (e.g., unsupported_country_code, cf_shield_429)
                     status_code = 429 if is_cf_or_429 else 400
                     await self.db.update_request_log(
@@ -904,24 +920,38 @@ class GenerationHandler:
                     log_updated = True  # Mark log as updated
             # Wrap exception with token_id information
             if token_obj:
-                raise GenerationError(str(e), token_id=token_obj.id)
+                if isinstance(e, GenerationError):
+                    raise GenerationError(
+                        str(e),
+                        token_id=e.token_id or token_obj.id,
+                        retry_allowed=e.retry_allowed and not task_submitted,
+                        task_id=e.task_id or task_id,
+                        task_submitted=e.task_submitted or task_submitted,
+                    )
+                raise GenerationError(
+                    str(e),
+                    token_id=token_obj.id,
+                    retry_allowed=not task_submitted,
+                    task_id=task_id,
+                    task_submitted=task_submitted,
+                )
             else:
                 raise e
 
         finally:
             # Ensure log is updated even if exception handling fails
-            # This prevents logs from being stuck at status_code = -1
             if log_id and not log_updated:
                 try:
-                    # Log was not updated in try or except blocks, update it now
-                    duration = time.time() - start_time
-                    await self.db.update_request_log(
-                        log_id,
-                        response_body=json.dumps({"error": "Task failed or interrupted during processing"}),
-                        status_code=500,
-                        duration=duration
-                    )
-                    debug_logger.log_info(f"Updated stuck log entry {log_id} from status -1 to 500 in finally block")
+                    if await self._is_request_log_finalized(log_id):
+                        log_updated = True
+                    else:
+                        duration = time.time() - start_time
+                        await self.db.update_request_log(
+                            log_id,
+                            response_body=json.dumps({"error": "Task failed or interrupted during processing"}),
+                            status_code=500,
+                            duration=duration
+                        )
                 except Exception as finally_error:
                     # Don't let finally block errors break the flow
                     debug_logger.log_error(
@@ -976,6 +1006,13 @@ class GenerationHandler:
             except Exception as e:
                 last_error = e
                 error_str = str(e)
+                retry_allowed_by_exception = not isinstance(e, GenerationError) or e.retry_allowed
+                should_retry = (
+                    retry_enabled and
+                    retry_count < max_retries and
+                    retry_allowed_by_exception and
+                    self._should_retry_on_error(e)
+                )
 
                 # Extract token_id from GenerationError if available
                 if isinstance(e, GenerationError) and e.token_id:
@@ -990,8 +1027,11 @@ class GenerationHandler:
                     try:
                         await self.db.update_token_status(last_token_id, False)
                         if stream:
+                            message = f"**检测到401错误，已自动禁用Token {last_token_id}**\\n\\n"
+                            if should_retry:
+                                message += "正在使用其他Token重试...\\n\\n"
                             yield self._format_stream_chunk(
-                                reasoning_content=f"**检测到401错误，已自动禁用Token {last_token_id}**\\n\\n正在使用其他Token重试...\\n\\n"
+                                reasoning_content=message
                             )
                     except Exception as disable_error:
                         debug_logger.log_error(
@@ -999,13 +1039,6 @@ class GenerationHandler:
                             status_code=500,
                             response_text=str(disable_error)
                         )
-
-                # Check if we should retry
-                should_retry = (
-                    retry_enabled and
-                    retry_count < max_retries and
-                    self._should_retry_on_error(e)
-                )
 
                 if should_retry:
                     retry_count += 1
@@ -1030,19 +1063,25 @@ class GenerationHandler:
     async def _poll_task_result(self, task_id: str, token: str, is_video: bool,
                                 stream: bool, prompt: str, token_id: int = None,
                                 log_id: int = None, start_time: float = None,
-                                polling_context: Optional[PollingContext] = None) -> AsyncGenerator[str, None]:
+                                polling_context: Optional[PollingContext] = None,
+                                request_log_success_payload: Optional[Dict[str, Any]] = None) -> AsyncGenerator[str, None]:
         """Poll for task result with timeout"""
         # Get timeout from config
         timeout = config.video_timeout if is_video else config.image_timeout
         poll_interval = min(max(config.poll_interval, 2.0), 3.0) if is_video else config.poll_interval
         max_attempts = int(timeout / poll_interval)  # Calculate max attempts based on timeout
         last_progress = 0
+        request_start_time = start_time
         start_time = time.time()
         last_heartbeat_time = start_time  # Track last heartbeat for image generation
         heartbeat_interval = 10  # Send heartbeat every 10 seconds for image generation
         last_status_output_time = start_time  # Track last status output time for video generation
         video_status_interval = 30  # Output status every 30 seconds for video generation
         last_pending_status = None
+        pending_seen_before = False
+        pending_missing_phase_active = False
+        drafts_lookup_started_at: Optional[float] = None
+        last_drafts_wait_notice_time: Optional[float] = None
 
         debug_logger.log_info(f"Starting task polling: task_id={task_id}, is_video={is_video}, timeout={timeout}s, max_attempts={max_attempts}")
 
@@ -1091,8 +1130,8 @@ class GenerationHandler:
                 await self.db.update_task(task_id, "failed", 0, error_message=f"Generation timeout after {elapsed_time:.1f} seconds")
 
                 # Update request log with timeout error
-                if log_id and start_time:
-                    duration = time.time() - start_time
+                if log_id and request_start_time:
+                    duration = time.time() - request_start_time
                     await self.db.update_request_log(
                         log_id,
                         response_body=json.dumps({"error": f"Generation timeout after {elapsed_time:.1f} seconds"}),
@@ -1114,7 +1153,6 @@ class GenerationHandler:
                     if polling_context is None:
                         raise PollingClientError("polling_context_missing", "Video task is missing a task-scoped polling context")
 
-                    # Get pending tasks to check progress
                     await self.db.update_task_stage(task_id, current_stage="polling")
                     pending_tasks, polling_context = await self.polling_client.get_pending_tasks(
                         task_id=task_id,
@@ -1128,11 +1166,19 @@ class GenerationHandler:
                             json.dumps(polling_context.to_dict(), ensure_ascii=False),
                         )
 
-                    # Find matching task in pending tasks
                     task_found = False
                     for task in pending_tasks:
                         if task.get("id") == task_id:
                             task_found = True
+                            pending_seen_before = True
+                            if pending_missing_phase_active:
+                                pending_missing_phase_active = False
+                                drafts_lookup_started_at = None
+                                last_drafts_wait_notice_time = None
+                                debug_logger.log_info(
+                                    f"Task {task_id} reappeared in pending tasks, resuming pending polling"
+                                )
+
                             # Update progress
                             progress_pct = task.get("progress_pct")
                             # Handle null progress at the beginning
@@ -1171,35 +1217,54 @@ class GenerationHandler:
                                 )
                             break
 
-                    # If task not found in pending tasks, it's completed - fetch from drafts
-                    if not task_found:
-                        debug_logger.log_info(f"Task {task_id} not found in pending tasks, fetching from drafts...")
+                    if task_found:
+                        continue
+
+                    current_time = time.time()
+                    if not pending_missing_phase_active:
+                        pending_missing_phase_active = True
+                        drafts_lookup_started_at = current_time
+                        last_drafts_wait_notice_time = None
+                        debug_logger.log_info(f"Task {task_id} not found in pending tasks, checking drafts_v2...")
+                        if pending_seen_before:
+                            await self._record_task_event(
+                                task_id,
+                                token_id,
+                                "pending_empty",
+                                "polling",
+                                "success",
+                                "task disappeared from pending; checking drafts_v2",
+                                {"drafts_api_version": "v2"},
+                            )
                         await self._record_task_event(
                             task_id,
                             token_id,
-                            "pending_empty",
-                            "polling",
-                            "success",
-                            "task disappeared from pending; switching to drafts_v2",
-                            {"drafts_api_version": "v2"},
+                            "drafts_lookup_started",
+                            "drafts_lookup",
+                            "running",
+                            "pending_v2 miss; checking drafts_v2 for completed task",
+                            {
+                                "drafts_api_version": "v2",
+                                "pending_seen_before": pending_seen_before,
+                            },
                         )
-                        await self.db.update_task_stage(task_id, current_stage="drafts_lookup")
-                        result, polling_context = await self.polling_client.get_video_drafts(
-                            task_id=task_id,
-                            token_id=token_id,
-                            access_token=token,
-                            polling_context=polling_context,
-                        )
-                        if polling_context:
-                            await self.db.update_task_polling_context(
-                                task_id,
-                                json.dumps(polling_context.to_dict(), ensure_ascii=False),
-                            )
-                        items = result.get("items", [])
 
-                        # Find matching task in drafts
-                        matched_draft = False
-                        for item in items:
+                    result, polling_context = await self.polling_client.get_video_drafts(
+                        task_id=task_id,
+                        token_id=token_id,
+                        access_token=token,
+                        polling_context=polling_context,
+                    )
+                    if polling_context:
+                        await self.db.update_task_polling_context(
+                            task_id,
+                            json.dumps(polling_context.to_dict(), ensure_ascii=False),
+                        )
+                    items = result.get("items", [])
+
+                    # Find matching task in drafts
+                    matched_draft = False
+                    for item in items:
                             if item.get("task_id") == task_id:
                                 matched_draft = True
                                 # Check for content violation
@@ -1464,6 +1529,13 @@ class GenerationHandler:
                                     task_id, "completed", 100.0,
                                     result_urls=json.dumps([local_url])
                                 )
+                                await self._mark_request_log_success(
+                                    log_id,
+                                    request_start_time,
+                                    task_id,
+                                    prompt,
+                                    extra_fields=request_log_success_payload,
+                                )
 
                                 if stream:
                                     # Final response with content
@@ -1473,8 +1545,37 @@ class GenerationHandler:
                                     )
                                     yield "data: [DONE]\n\n"
                                 return
-                        if not matched_draft:
-                            raise PollingClientError("polling_drafts_not_found", f"drafts_v2 did not return task {task_id}")
+                    if not matched_draft:
+                        current_time = time.time()
+                        drafts_wait_elapsed = (
+                            current_time - drafts_lookup_started_at
+                            if drafts_lookup_started_at is not None
+                            else 0.0
+                        )
+                        if (
+                            last_drafts_wait_notice_time is None
+                            or current_time - last_drafts_wait_notice_time >= 15
+                        ):
+                            last_drafts_wait_notice_time = current_time
+                            await self._record_task_event(
+                                task_id,
+                                token_id,
+                                "drafts_lookup_miss",
+                                "drafts_lookup",
+                                "running",
+                                "drafts_v2 has not indexed the completed task yet",
+                                {
+                                    "drafts_api_version": "v2",
+                                    "drafts_wait_elapsed_seconds": round(drafts_wait_elapsed, 1),
+                                    "items_count": len(items),
+                                },
+                            )
+                            if stream and (current_time - last_status_output_time >= video_status_interval):
+                                last_status_output_time = current_time
+                                yield self._format_stream_chunk(
+                                    reasoning_content="\n**Video Generation Completed**\n\nWaiting for drafts synchronization...\n"
+                                )
+                        continue
                 else:
                     result = await self.sora_client.get_image_tasks(token, token_id=token_id)
                     task_responses = result.get("task_responses", [])
@@ -1538,6 +1639,13 @@ class GenerationHandler:
                                         task_id, "completed", 100.0,
                                         result_urls=json.dumps(local_urls)
                                     )
+                                    await self._mark_request_log_success(
+                                        log_id,
+                                        request_start_time,
+                                        task_id,
+                                        prompt,
+                                        extra_fields=request_log_success_payload,
+                                    )
 
                                     if stream:
                                         # Final response with content (Markdown format)
@@ -1586,7 +1694,7 @@ class GenerationHandler:
                             )
 
                 # Progress update for stream mode (fallback if no status from API)
-                if stream and attempt % 10 == 0:  # Update every 10 attempts (roughly 20% intervals)
+                if stream and not is_video and attempt % 10 == 0:  # Update every 10 attempts (roughly 20% intervals)
                     estimated_progress = min(90, (attempt / max_attempts) * 100)
                     if estimated_progress > last_progress + 20:  # Update every 20%
                         last_progress = estimated_progress
@@ -1622,8 +1730,8 @@ class GenerationHandler:
                         error_category=failure_category,
                     )
                     await self.db.update_task(task_id, "failed", last_progress, error_message=str(e), current_stage=failure_stage)
-                    if log_id and start_time:
-                        duration = time.time() - start_time
+                    if log_id and request_start_time:
+                        duration = time.time() - request_start_time
                         await self.db.update_request_log(
                             log_id,
                             response_body=json.dumps({"error": str(e), "error_code": e.code}),
@@ -1655,8 +1763,8 @@ class GenerationHandler:
                     await self.db.update_task(task_id, "failed", 0, error_message="Cloudflare challenge or rate limit (429) triggered")
 
                     # Update request log with CF/429 error
-                    if log_id and start_time:
-                        duration = time.time() - start_time
+                    if log_id and request_start_time:
+                        duration = time.time() - request_start_time
                         await self.db.update_request_log(
                             log_id,
                             response_body=json.dumps({"error": "Cloudflare challenge or rate limit (429) triggered"}),
@@ -1815,6 +1923,47 @@ class GenerationHandler:
             # Don't fail the request if logging fails
             print(f"Failed to log request: {e}")
             return None
+
+    async def _is_request_log_finalized(self, log_id: Optional[int]) -> bool:
+        """Whether the request log has already left the in-progress state."""
+        if not log_id:
+            return False
+        status_code = await self.db.get_request_log_status(log_id)
+        return status_code is not None and status_code != -1
+
+    async def _mark_request_log_success(
+        self,
+        log_id: Optional[int],
+        request_start_time: Optional[float],
+        task_id: str,
+        prompt: str,
+        extra_fields: Optional[Dict[str, Any]] = None,
+    ):
+        """Persist a successful request log before the stream can be interrupted."""
+        if not log_id or request_start_time is None:
+            return
+
+        response_data: Dict[str, Any] = {
+            "task_id": task_id,
+            "status": "success",
+            "prompt": prompt,
+        }
+        if extra_fields:
+            response_data.update(extra_fields)
+
+        task_info = await self.db.get_task(task_id)
+        if task_info and task_info.result_urls:
+            try:
+                response_data["result_urls"] = json.loads(task_info.result_urls)
+            except Exception:
+                response_data["result_urls"] = task_info.result_urls
+
+        await self.db.update_request_log(
+            log_id,
+            response_body=json.dumps(response_data),
+            status_code=200,
+            duration=time.time() - request_start_time,
+        )
 
     def _extract_mutation_submission(self, result) -> tuple[str, Optional[MutationResult]]:
         """Normalize legacy string task ids and new MutationResult payloads."""
@@ -2635,7 +2784,14 @@ class GenerationHandler:
                 True,
                 clean_prompt,
                 token_obj.id,
+                log_id,
+                start_time,
                 polling_context=submission.polling_context if submission else None,
+                request_log_success_payload={
+                    "model": model_name,
+                    "generation_id": generation_id,
+                    "extension_duration_s": extension_duration_s,
+                },
             ):
                 yield chunk
 
@@ -2750,14 +2906,21 @@ class GenerationHandler:
                 True,
                 clean_prompt,
                 token_obj.id,
+                log_id,
+                start_time,
                 polling_context=submission.polling_context if submission else None,
+                request_log_success_payload={
+                    "model": model_name,
+                    "generation_id": generation_id,
+                    "extension_duration_s": extension_duration_s,
+                },
             ):
                 yield chunk
 
             await self.token_manager.record_success(token_obj.id, is_video=True)
 
             # Update request log on success
-            if log_id:
+            if log_id and not await self._is_request_log_finalized(log_id):
                 duration = time.time() - start_time
                 task_info = await self.db.get_task(task_id)
                 response_data = {
@@ -2780,6 +2943,7 @@ class GenerationHandler:
                     status_code=200,
                     duration=duration
                 )
+            if log_id:
                 log_updated = True
 
         except Exception as e:
@@ -2803,22 +2967,25 @@ class GenerationHandler:
 
             # Update request log on error
             if log_id:
-                duration = time.time() - start_time
-                if error_response:
-                    await self.db.update_request_log(
-                        log_id,
-                        response_body=json.dumps(error_response),
-                        status_code=429 if is_cf_or_429 else 400,
-                        duration=duration
-                    )
+                if await self._is_request_log_finalized(log_id):
+                    log_updated = True
                 else:
-                    await self.db.update_request_log(
-                        log_id,
-                        response_body=json.dumps({"error": str(e)}),
-                        status_code=500,
-                        duration=duration
-                    )
-                log_updated = True
+                    duration = time.time() - start_time
+                    if error_response:
+                        await self.db.update_request_log(
+                            log_id,
+                            response_body=json.dumps(error_response),
+                            status_code=429 if is_cf_or_429 else 400,
+                            duration=duration
+                        )
+                    else:
+                        await self.db.update_request_log(
+                            log_id,
+                            response_body=json.dumps({"error": str(e)}),
+                            status_code=500,
+                            duration=duration
+                        )
+                    log_updated = True
 
             debug_logger.log_error(
                 error_message=f"Video extension failed: {str(e)}",
@@ -2827,16 +2994,19 @@ class GenerationHandler:
             )
             raise
         finally:
-            # Ensure log is not stuck at in-progress
+            # Ensure log is updated even if exception handling fails
             if log_id and not log_updated:
                 try:
-                    duration = time.time() - start_time
-                    await self.db.update_request_log(
-                        log_id,
-                        response_body=json.dumps({"error": "Task failed or interrupted during processing"}),
-                        status_code=500,
-                        duration=duration
-                    )
+                    if await self._is_request_log_finalized(log_id):
+                        log_updated = True
+                    else:
+                        duration = time.time() - start_time
+                        await self.db.update_request_log(
+                            log_id,
+                            response_body=json.dumps({"error": "Task failed or interrupted during processing"}),
+                            status_code=500,
+                            duration=duration
+                        )
                 except Exception as finally_error:
                     debug_logger.log_error(
                         error_message=f"Failed to update video extension log in finally block: {str(finally_error)}",

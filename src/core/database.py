@@ -77,6 +77,14 @@ TOKEN_TABLE_COLUMN_DEFINITIONS = (
 )
 
 TOKEN_TABLE_COLUMN_NAMES = tuple(column_name for column_name, _ in TOKEN_TABLE_COLUMN_DEFINITIONS)
+DEFAULT_NST_BROWSER_API_KEY = "fa7f8e88-1682-4075-9cfd-f54c9a240273"
+
+
+def _default_nst_browser_api_key(config_dict: Optional[dict] = None) -> str:
+    raw_value = None
+    if config_dict:
+        raw_value = config_dict.get("nst_browser", {}).get("api_key")
+    return str(raw_value or DEFAULT_NST_BROWSER_API_KEY)
 
 class Database:
     """SQLite database manager"""
@@ -195,6 +203,7 @@ class Database:
             admin_username = "admin"
             admin_password = "admin"
             api_key = "han1234"
+            nst_browser_api_key = _default_nst_browser_api_key(config_dict)
             error_ban_threshold = 3
             task_retry_enabled = True
             task_max_retries = 3
@@ -205,6 +214,7 @@ class Database:
                 admin_username = global_config.get("admin_username", "admin")
                 admin_password = global_config.get("admin_password", "admin")
                 api_key = global_config.get("api_key", "han1234")
+                nst_browser_api_key = _default_nst_browser_api_key(config_dict)
 
                 admin_config = config_dict.get("admin", {})
                 error_ban_threshold = admin_config.get("error_ban_threshold", 3)
@@ -213,9 +223,21 @@ class Database:
                 auto_disable_on_401 = admin_config.get("auto_disable_on_401", True)
 
             await db.execute("""
-                INSERT INTO admin_config (id, admin_username, admin_password, api_key, error_ban_threshold, task_retry_enabled, task_max_retries, auto_disable_on_401)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-            """, (admin_username, admin_password, api_key, error_ban_threshold, task_retry_enabled, task_max_retries, auto_disable_on_401))
+                INSERT INTO admin_config (
+                    id, admin_username, admin_password, api_key, nst_browser_api_key,
+                    error_ban_threshold, task_retry_enabled, task_max_retries, auto_disable_on_401
+                )
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                admin_username,
+                admin_password,
+                api_key,
+                nst_browser_api_key,
+                error_ban_threshold,
+                task_retry_enabled,
+                task_max_retries,
+                auto_disable_on_401,
+            ))
 
         # Ensure proxy_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM proxy_config")
@@ -517,6 +539,7 @@ class Database:
                     ("admin_username", "TEXT DEFAULT 'admin'"),
                     ("admin_password", "TEXT DEFAULT 'admin'"),
                     ("api_key", "TEXT DEFAULT 'han1234'"),
+                    ("nst_browser_api_key", f"TEXT DEFAULT '{DEFAULT_NST_BROWSER_API_KEY}'"),
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -526,6 +549,17 @@ class Database:
                             print(f"  ✓ Added column '{col_name}' to admin_config table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+                if await self._column_exists(db, "admin_config", "nst_browser_api_key"):
+                    try:
+                        await db.execute("""
+                            UPDATE admin_config
+                            SET nst_browser_api_key = ?
+                            WHERE id = 1
+                              AND (nst_browser_api_key IS NULL OR TRIM(nst_browser_api_key) = '')
+                        """, (_default_nst_browser_api_key(config_dict),))
+                    except Exception as e:
+                        print(f"  ✗ Failed to initialize nst_browser_api_key from config: {e}")
 
             # Check and add missing columns to proxy_config table
             if await self._table_exists(db, "proxy_config"):
@@ -874,6 +908,7 @@ class Database:
                     admin_username TEXT DEFAULT 'admin',
                     admin_password TEXT DEFAULT 'admin',
                     api_key TEXT DEFAULT 'han1234',
+                    nst_browser_api_key TEXT DEFAULT 'fa7f8e88-1682-4075-9cfd-f54c9a240273',
                     error_ban_threshold INTEGER DEFAULT 3,
                     task_retry_enabled BOOLEAN DEFAULT 1,
                     task_max_retries INTEGER DEFAULT 3,
@@ -1010,6 +1045,17 @@ class Database:
                 await db.execute("ALTER TABLE admin_config ADD COLUMN task_max_retries INTEGER DEFAULT 3")
             if not await self._column_exists(db, "admin_config", "auto_disable_on_401"):
                 await db.execute("ALTER TABLE admin_config ADD COLUMN auto_disable_on_401 BOOLEAN DEFAULT 1")
+            if not await self._column_exists(db, "admin_config", "nst_browser_api_key"):
+                await db.execute(
+                    f"ALTER TABLE admin_config ADD COLUMN nst_browser_api_key TEXT DEFAULT '{DEFAULT_NST_BROWSER_API_KEY}'"
+                )
+            if await self._column_exists(db, "admin_config", "nst_browser_api_key"):
+                await db.execute("""
+                    UPDATE admin_config
+                    SET nst_browser_api_key = ?
+                    WHERE id = 1
+                      AND (nst_browser_api_key IS NULL OR TRIM(nst_browser_api_key) = '')
+                """, (_default_nst_browser_api_key(config_dict),))
 
             # Migration: Add image upload proxy columns to proxy_config table if they don't exist
             added_image_upload_proxy_enabled_column = False
@@ -1731,6 +1777,16 @@ class Database:
             """, (task_id, log_id))
             await db.commit()
 
+    async def get_request_log_status(self, log_id: int) -> Optional[int]:
+        """Get the current status code for a request log."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT status_code FROM request_logs WHERE id = ?",
+                (log_id,),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
     async def get_recent_logs(self, limit: int = 100) -> List[dict]:
         """Get recent logs with token email, collapsed to one primary row per task."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -1981,19 +2037,32 @@ class Database:
                 return AdminConfig(**dict(row))
             # If no row exists, return a default config with placeholder values
             # This should not happen in normal operation as _ensure_config_rows should create it
-            return AdminConfig(admin_username="admin", admin_password="admin", api_key="han1234")
+            return AdminConfig(
+                admin_username="admin",
+                admin_password="admin",
+                api_key="han1234",
+                nst_browser_api_key=DEFAULT_NST_BROWSER_API_KEY,
+            )
     
     async def update_admin_config(self, config: AdminConfig):
         """Update admin configuration"""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 UPDATE admin_config
-                SET admin_username = ?, admin_password = ?, api_key = ?, error_ban_threshold = ?,
+                SET admin_username = ?, admin_password = ?, api_key = ?, nst_browser_api_key = ?, error_ban_threshold = ?,
                     task_retry_enabled = ?, task_max_retries = ?, auto_disable_on_401 = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = 1
-            """, (config.admin_username, config.admin_password, config.api_key, config.error_ban_threshold,
-                  config.task_retry_enabled, config.task_max_retries, config.auto_disable_on_401))
+            """, (
+                config.admin_username,
+                config.admin_password,
+                config.api_key,
+                config.nst_browser_api_key,
+                config.error_ban_threshold,
+                config.task_retry_enabled,
+                config.task_max_retries,
+                config.auto_disable_on_401,
+            ))
             await db.commit()
     
     # Proxy config operations

@@ -128,6 +128,7 @@ async def startup_event():
     config.set_admin_username_from_db(admin_config.admin_username)
     config.set_admin_password_from_db(admin_config.admin_password)
     config.api_key = admin_config.api_key
+    config.nst_browser_api_key = admin_config.nst_browser_api_key or ""
 
     # Load cache configuration from database
     cache_config = await db.get_cache_config()

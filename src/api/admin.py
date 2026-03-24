@@ -141,10 +141,11 @@ class PureRtImportRequest(BaseModel):
     video_concurrency: int = 3  # Video concurrency limit (default: 3)
 
 class UpdateAdminConfigRequest(BaseModel):
-    error_ban_threshold: int
+    error_ban_threshold: Optional[int] = None
     task_retry_enabled: Optional[bool] = None
     task_max_retries: Optional[int] = None
     auto_disable_on_401: Optional[bool] = None
+    nst_browser_api_key: Optional[str] = None
 
 class UpdateProxyConfigRequest(BaseModel):
     proxy_enabled: Optional[bool] = None
@@ -935,6 +936,7 @@ async def get_admin_config(token: str = Depends(verify_admin_token)) -> dict:
         "task_max_retries": admin_config.task_max_retries,
         "auto_disable_on_401": admin_config.auto_disable_on_401,
         "api_key": config.api_key,
+        "nst_browser_api_key": config.nst_browser_api_key,
         "admin_username": config.admin_username,
         "debug_enabled": config.debug_enabled
     }
@@ -949,8 +951,8 @@ async def update_admin_config(
         # Get current admin config to preserve username and password
         current_config = await db.get_admin_config()
 
-        # Update error_ban_threshold
-        current_config.error_ban_threshold = request.error_ban_threshold
+        if request.error_ban_threshold is not None:
+            current_config.error_ban_threshold = request.error_ban_threshold
 
         # Update retry settings if provided
         if request.task_retry_enabled is not None:
@@ -959,8 +961,12 @@ async def update_admin_config(
             current_config.task_max_retries = request.task_max_retries
         if request.auto_disable_on_401 is not None:
             current_config.auto_disable_on_401 = request.auto_disable_on_401
+        if request.nst_browser_api_key is not None:
+            current_config.nst_browser_api_key = request.nst_browser_api_key
 
         await db.update_admin_config(current_config)
+        if request.nst_browser_api_key is not None:
+            config.nst_browser_api_key = request.nst_browser_api_key
         return {"success": True, "message": "Configuration updated"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -1,7 +1,9 @@
 """Tests for NST browser provider start path selection."""
 import asyncio
+import copy
 import unittest
 
+from src.core.config import config
 from src.services.browser_provider import BrowserProviderError
 from src.services.nst_browser_provider import NSTBrowserProvider
 
@@ -25,6 +27,12 @@ class _FakeNSTBrowserProvider(NSTBrowserProvider):
 
 
 class NSTBrowserProviderTests(unittest.TestCase):
+    def setUp(self):
+        self._nst_browser_config = copy.deepcopy(config._config.get("nst_browser", {}))
+
+    def tearDown(self):
+        config._config["nst_browser"] = self._nst_browser_config
+
     def test_start_prefers_plain_browsers_endpoint(self):
         async def scenario():
             provider = _FakeNSTBrowserProvider([
@@ -95,6 +103,21 @@ class NSTBrowserProviderTests(unittest.TestCase):
             )
 
         asyncio.run(scenario())
+
+    def test_headers_follow_runtime_config_without_recreating_provider(self):
+        provider = NSTBrowserProvider(base_url="http://127.0.0.1:8848/api/v2")
+        config._config["nst_browser"] = {
+            "base_url": "http://127.0.0.1:8848/api/v2",
+            "api_key": "first-key",
+        }
+
+        self.assertEqual(provider._headers, {"x-api-key": "first-key"})
+
+        config.nst_browser_api_key = "second-key"
+        self.assertEqual(provider._headers, {"x-api-key": "second-key"})
+
+        config.nst_browser_api_key = ""
+        self.assertEqual(provider._headers, {})
 
 
 if __name__ == "__main__":
