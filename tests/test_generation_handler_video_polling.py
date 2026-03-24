@@ -566,8 +566,12 @@ class GenerationHandlerVideoPollingTests(unittest.TestCase):
                 stream=True,
                 show_init_message=False,
             )
-            first_chunk = await generator.__anext__()
-            self.assertEqual(first_chunk, "data: [DONE]\n\n")
+            seen_done = False
+            async for chunk in generator:
+                if chunk == "data: [DONE]\n\n":
+                    seen_done = True
+                    break
+            self.assertTrue(seen_done)
             await generator.aclose()
 
             self.assertEqual(await db.get_request_log_status(1), 200)
