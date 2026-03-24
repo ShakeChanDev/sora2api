@@ -1,5 +1,5 @@
 """Admin routes - Management endpoints"""
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, File, Form, UploadFile
 from fastapi.responses import FileResponse
 from typing import List, Optional
 from datetime import datetime
@@ -14,6 +14,7 @@ from ..core.logger import debug_logger
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
+from ..services.reference_service import ReferenceService
 from ..core.database import Database
 from ..core.models import Token, AdminConfig, ProxyConfig
 
@@ -26,6 +27,7 @@ db: Database = None
 generation_handler = None
 concurrency_manager: ConcurrencyManager = None
 scheduler = None
+reference_service: ReferenceService = None
 
 # Store active admin tokens (in production, use Redis or database)
 active_admin_tokens = set()
@@ -40,15 +42,24 @@ def _masked_proxy(value: Optional[str]) -> Optional[str]:
     """Mask proxy details before returning them to admin clients."""
     return debug_logger.mask_proxy_url(value)
 
-def set_dependencies(tm: TokenManager, pm: ProxyManager, database: Database, gh=None, cm: ConcurrencyManager = None, sched=None):
+def set_dependencies(
+    tm: TokenManager,
+    pm: ProxyManager,
+    database: Database,
+    gh=None,
+    cm: ConcurrencyManager = None,
+    sched=None,
+    rs: ReferenceService = None,
+):
     """Set dependencies"""
-    global token_manager, proxy_manager, db, generation_handler, concurrency_manager, scheduler
+    global token_manager, proxy_manager, db, generation_handler, concurrency_manager, scheduler, reference_service
     token_manager = tm
     proxy_manager = pm
     db = database
     generation_handler = gh
     concurrency_manager = cm
     scheduler = sched
+    reference_service = rs
 
 def verify_admin_token(authorization: str = Header(None)):
     """Verify admin token from Authorization header"""
@@ -924,6 +935,84 @@ async def update_token(
         return {"success": True, "message": "Token updated"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/references")
+async def get_references(token: str = Depends(verify_admin_token)) -> List[dict]:
+    """List platform-local references."""
+    if not reference_service:
+        raise HTTPException(status_code=500, detail="Reference service not configured")
+    return await reference_service.list_references()
+
+
+@router.post("/api/references")
+async def create_reference(
+    name: str = Form(...),
+    description: Optional[str] = Form(None),
+    reference_type: str = Form("other", alias="type"),
+    image: UploadFile = File(...),
+    token: str = Depends(verify_admin_token),
+):
+    """Create a platform-local reference."""
+    if not reference_service:
+        raise HTTPException(status_code=500, detail="Reference service not configured")
+    try:
+        image_bytes = await image.read()
+        result = await reference_service.create_reference(
+            name=name,
+            description=description,
+            reference_type=reference_type,
+            image_bytes=image_bytes,
+            filename=image.filename,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/api/references/{reference_id}")
+async def update_reference(
+    reference_id: str,
+    name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    reference_type: Optional[str] = Form(None, alias="type"),
+    image: Optional[UploadFile] = File(None),
+    token: str = Depends(verify_admin_token),
+):
+    """Update a platform-local reference."""
+    if not reference_service:
+        raise HTTPException(status_code=500, detail="Reference service not configured")
+    try:
+        image_bytes = await image.read() if image else None
+        result = await reference_service.update_reference(
+            reference_id=reference_id,
+            name=name,
+            description=description,
+            reference_type=reference_type,
+            image_bytes=image_bytes,
+            filename=image.filename if image else None,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/references/{reference_id}")
+async def delete_reference(reference_id: str, token: str = Depends(verify_admin_token)):
+    """Delete a platform-local reference."""
+    if not reference_service:
+        raise HTTPException(status_code=500, detail="Reference service not configured")
+    try:
+        await reference_service.delete_reference(reference_id)
+        return {"success": True, "message": "Reference deleted"}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Admin config endpoints
 @router.get("/api/admin/config")

@@ -274,7 +274,7 @@ docker-compose -f docker-compose.warp.yml logs -f
 
 - 首次启动建表和初始化配置
 - 老库迁移与字段补齐
-- Token、任务、日志、后台配置的 CRUD
+- Token、任务、日志、后台配置、reference 主库与 reference 绑定的 CRUD
 - 在后台接口和启动流程之间充当状态中枢
 
 当前数据库层不仅存 Token，也存管理后台配置，因此它更像项目的“运行时状态中心”。
@@ -354,13 +354,26 @@ docker-compose -f docker-compose.warp.yml logs -f
 
 如果开启缓存，对外返回的媒体 URL 会依赖这里落盘的文件。
 
-### 9. `SoraClient`
+### 9. `ReferenceService`
+
+`src/services/reference_service.py` 负责本地 reference 主库和按账号自动同步：
+
+- 管理本地 `reference_id`、名称、描述、类型、源图路径和哈希
+- 管理 `reference_id + token_id -> upstream ref_xxx` 绑定
+- 校验 `references` 数量、类型和存在性
+- 在视频提交前，把本地 `reference_id` 解析成上游 `ref_xxx`
+- 按观察文档中的顺序执行 `file/upload -> references/create|update -> nf/create`
+
+这里是本次 `references` 能力的核心收口点。
+
+### 10. `SoraClient`
 
 `src/services/sora_client.py` 是上游请求层，职责最重：
 
 - 统一封装访问 Sora/ChatGPT 上游接口的请求
 - 处理 Sentinel/POW 相关流程
 - 上传图片、上传角色视频、生成图片/视频
+- 上传 reference 图片、创建/编辑/删除 upstream references
 - 拉取图片任务、视频草稿、任务状态
 - 执行无水印相关请求
 - 创建角色、设置角色公开、删除角色
@@ -369,7 +382,7 @@ docker-compose -f docker-compose.warp.yml logs -f
 
 如果你要排查“为什么请求上游失败”，这里通常是重点入口。
 
-### 10. `GenerationHandler`
+### 11. `GenerationHandler`
 
 `src/services/generation_handler.py` 是整个业务流的编排中心，当前可确认的关键职责有：
 
@@ -396,8 +409,25 @@ docker-compose -f docker-compose.warp.yml logs -f
 
 - `messages[-1].content` 支持字符串，或 OpenAI 风格的多模态数组。
 - 多模态数组支持 `text`、`image_url`、`video_url`。
-- 顶层还支持 `image`、`video`、`remix_target_id` 这些扩展字段。
+- 顶层还支持 `image`、`video`、`remix_target_id`、`references` 这些扩展字段。
 - 如果 prompt 中出现 `s_xxx...` 形式的 Remix ID，后端会尝试自动提取。
+
+`references` 相关约束：
+
+- 字段类型：`string[]`
+- 字段含义：Sora2API 本地 `reference_id` 数组，不是上游 `ref_xxx`
+- 数量限制：去重后最多 `5` 个
+- 支持范围：仅普通视频生成与分镜生成
+- 明确不支持：图片、提示词增强、avatar-create、Remix、长视频续写
+
+`references` 的上游字段结构和时序实现依据必须以 `C:/Codex/apps/Sora2Api/sora_reference_observation.md` 为准。
+
+已确认的关键结论：
+
+- 上游 `POST /backend/nf/create` 不接收顶层 `references`
+- 选中的 reference 会折叠进 `inpaint_items`
+- 单项结构固定为 `{ "kind": "reference", "reference_id": "<upstream_ref>" }`
+- create/edit reference 时序是 `POST /backend/project_y/file/upload` 先拿 `asset_pointer`，再调用 `/backend/project_y/references/create|{id}`
 
 当前支持的模型类型可从 `MODEL_CONFIG` 直接看出，主要包括：
 
@@ -419,6 +449,7 @@ docker-compose -f docker-compose.warp.yml logs -f
 - 认证：`/api/login`、`/api/logout`
 - Token 管理：`/api/tokens`、`/api/tokens/st2at`、`/api/tokens/rt2at`
 - Token 批量操作：`/api/tokens/batch/*`
+- Reference 主库：`/api/references`、`/api/references/{reference_id}`
 - 管理员配置：`/api/admin/config`、`/api/admin/password`、`/api/admin/apikey`
 - 调试开关：`/api/admin/debug`
 - 代理配置与测试：`/api/proxy/config`、`/api/proxy/test`
@@ -442,6 +473,7 @@ docker-compose -f docker-compose.warp.yml logs -f
 | `/manage` | `static/manage.html` | 管理后台主页 |
 | `/static/*` | `static/` | 前端静态资源 |
 | `/tmp/*` | `tmp/` | 缓存媒体资源 |
+| `/reference-assets/*` | `data/reference_assets/` | 本地 reference 源图预览资源 |
 
 已确认当前没有单独的 `/generate` 路由；管理页通过 iframe 直接加载 `/static/generate.html`。
 
@@ -450,8 +482,8 @@ docker-compose -f docker-compose.warp.yml logs -f
 ### 1. 启动初始化流程
 
 1. `main.py` 启动 `src.main:app`。
-2. `src/main.py` 创建 FastAPI 应用、注入 `Database`、`TokenManager`、`ProxyManager`、`LoadBalancer`、`SoraClient`、`GenerationHandler`。
-3. 挂载 `static/` 与 `tmp/`。
+2. `src/main.py` 创建 FastAPI 应用、注入 `Database`、`TokenManager`、`ProxyManager`、`LoadBalancer`、`SoraClient`、`ReferenceService`、`GenerationHandler`。
+3. 挂载 `static/`、`tmp/` 与 `reference-assets/`。
 4. 启动事件中初始化数据库、执行迁移检查。
 5. 从数据库加载管理员配置、缓存、生成超时、调用逻辑、POW 服务等运行参数。
 6. 初始化并发管理器、启动缓存清理任务。
@@ -479,9 +511,11 @@ docker-compose -f docker-compose.warp.yml logs -f
 1. 客户端指定视频模型，输入可以是纯文本，也可以附带图片或视频。
 2. `GenerationHandler` 判断是普通视频、图生视频、分镜生成还是其他视频变体。
 3. `LoadBalancer` 选择支持视频能力且满足配额的 Token。
-4. `SoraClient` 提交任务到上游。
-5. `GenerationHandler` 轮询任务进度，直到完成、失败或超时。
-6. 成功后格式化为流式 chunk 或非流式响应。
+4. 如果请求带有本地 `references`，`ReferenceService` 会先校验数量和存在性，再针对选中的 token 做上游同步。
+5. 同步路径遵循 `C:/Codex/apps/Sora2Api/sora_reference_observation.md` 中确认的时序：先 `file/upload` 拿 `asset_pointer`，再 `references/create|update`。
+6. `SoraClient` 最终把解析好的 upstream `ref_xxx` 写进 `inpaint_items`，与已有 upload 项共存后提交 `nf/create`。
+7. `GenerationHandler` 轮询任务进度，直到完成、失败或超时。
+8. 成功后格式化为流式 chunk 或非流式响应。
 
 ### 5. 无水印流程
 

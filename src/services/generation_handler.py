@@ -5,7 +5,7 @@ import base64
 import time
 import random
 import re
-from typing import Optional, AsyncGenerator, Dict, Any
+from typing import Optional, AsyncGenerator, Dict, Any, List
 from datetime import datetime
 from .sora_client import SoraClient
 from .token_manager import TokenManager
@@ -14,6 +14,7 @@ from .file_cache import FileCache
 from .concurrency_manager import ConcurrencyManager
 from .browser_provider import MutationResult, PollingContext
 from .polling_client import PollingClient, PollingClientError
+from .reference_service import ReferenceService
 from ..core.database import Database
 from ..core.models import Task, RequestLog
 from ..core.config import config
@@ -245,13 +246,15 @@ class GenerationHandler:
     def __init__(self, sora_client: SoraClient, token_manager: TokenManager,
                  load_balancer: LoadBalancer, db: Database, proxy_manager=None,
                  concurrency_manager: Optional[ConcurrencyManager] = None,
-                 polling_client: Optional[PollingClient] = None):
+                 polling_client: Optional[PollingClient] = None,
+                 reference_service: Optional[ReferenceService] = None):
         self.sora_client = sora_client
         self.token_manager = token_manager
         self.load_balancer = load_balancer
         self.db = db
         self.concurrency_manager = concurrency_manager
         self.polling_client = polling_client
+        self.reference_service = reference_service
         self.file_cache = FileCache(
             cache_dir="tmp",
             default_timeout=config.cache_timeout,
@@ -539,6 +542,7 @@ class GenerationHandler:
                                image: Optional[str] = None,
                                video: Optional[str] = None,
                                remix_target_id: Optional[str] = None,
+                               references: Optional[List[str]] = None,
                                stream: bool = True,
                                show_init_message: bool = True) -> AsyncGenerator[str, None]:
         """Handle generation request
@@ -549,6 +553,7 @@ class GenerationHandler:
             image: Base64 encoded image
             video: Base64 encoded video or video URL
             remix_target_id: Sora share link video ID for remix
+            references: Optional platform-local reference ids
             stream: Whether to stream response
             show_init_message: Whether to show "Generation Process Begins" message
         """
@@ -565,6 +570,10 @@ class GenerationHandler:
         is_image = model_config["type"] == "image"
         is_prompt_enhance = model_config["type"] == "prompt_enhance"
         is_avatar_create = model_config["type"] == "avatar_create"
+        resolved_reference_ids: List[str] = []
+
+        if references and self.reference_service and model_config["type"] == "video" and model_config.get("mode") != "video_extension" and not remix_target_id:
+            await self.reference_service.validate_reference_ids(references)
 
         # Handle prompt enhancement
         if is_prompt_enhance:
@@ -682,7 +691,12 @@ class GenerationHandler:
             log_id = await self._log_request(
                 token_obj.id,
                 f"generate_{model_config['type']}",
-                {"model": model, "prompt": prompt, "has_image": image is not None},
+                {
+                    "model": model,
+                    "prompt": prompt,
+                    "has_image": image is not None,
+                    "references": references or [],
+                },
                 {},  # Empty response initially
                 -1,  # -1 means in-progress
                 -1.0,  # -1.0 means in-progress
@@ -709,6 +723,21 @@ class GenerationHandler:
                 if stream:
                     yield self._format_stream_chunk(
                         reasoning_content="Image uploaded successfully. Proceeding to generation...\n"
+                    )
+
+            if is_video and references and self.reference_service and not remix_target_id and model_config.get("mode") != "video_extension":
+                if stream:
+                    yield self._format_stream_chunk(
+                        reasoning_content="Synchronizing references for the selected account...\n"
+                    )
+                resolved_reference_ids = await self.reference_service.resolve_references_for_token(
+                    reference_ids=references,
+                    token_id=token_obj.id,
+                    token=token_obj.token,
+                )
+                if stream and resolved_reference_ids:
+                    yield self._format_stream_chunk(
+                        reasoning_content=f"References ready: {len(resolved_reference_ids)} item(s).\n"
                     )
 
             # Generate
@@ -748,7 +777,8 @@ class GenerationHandler:
                         media_id=media_id,
                         n_frames=n_frames,
                         style_id=style_id,
-                        token_id=token_obj.id
+                        token_id=token_obj.id,
+                        reference_ids=resolved_reference_ids,
                     )
                     task_id, submission = self._extract_mutation_submission(task_result)
                 else:
@@ -765,7 +795,8 @@ class GenerationHandler:
                         style_id=style_id,
                         model=sora_model,
                         size=video_size,
-                        token_id=token_obj.id
+                        token_id=token_obj.id,
+                        reference_ids=resolved_reference_ids,
                     )
                     task_id, submission = self._extract_mutation_submission(task_result)
             else:
@@ -799,6 +830,14 @@ class GenerationHandler:
 
             # Record usage
             await self.token_manager.record_usage(token_obj.id, is_video=is_video)
+
+            if stream and task_id:
+                yield self._format_stream_chunk(
+                    reasoning_content=f"Task submitted successfully. task_id: {task_id}\n",
+                    output=[{"task_id": task_id}],
+                    is_first=is_first_chunk,
+                )
+                is_first_chunk = False
             
             # Poll for results with timeout
             async for chunk in self._poll_task_result(
@@ -964,6 +1003,7 @@ class GenerationHandler:
                                           image: Optional[str] = None,
                                           video: Optional[str] = None,
                                           remix_target_id: Optional[str] = None,
+                                          references: Optional[List[str]] = None,
                                           stream: bool = True) -> AsyncGenerator[str, None]:
         """Handle generation request with automatic retry on failure
 
@@ -973,6 +1013,7 @@ class GenerationHandler:
             image: Base64 encoded image
             video: Base64 encoded video or video URL
             remix_target_id: Sora share link video ID for remix
+            references: Optional platform-local reference ids
             stream: Whether to stream response
         """
         # Get admin config for retry settings
@@ -996,6 +1037,7 @@ class GenerationHandler:
                     image,
                     video,
                     remix_target_id,
+                    references,
                     stream,
                     show_init_message=show_init
                 ):
@@ -1178,7 +1220,6 @@ class GenerationHandler:
                                 debug_logger.log_info(
                                     f"Task {task_id} reappeared in pending tasks, resuming pending polling"
                                 )
-
                             # Update progress
                             progress_pct = task.get("progress_pct")
                             # Handle null progress at the beginning
@@ -1270,8 +1311,12 @@ class GenerationHandler:
                                 # Check for content violation
                                 kind = item.get("kind")
                                 reason_str = item.get("reason_str") or item.get("markdown_reason_str")
+                                error_reason = item.get("error_reason")
                                 url = item.get("url") or item.get("downloadable_url")
-                                debug_logger.log_info(f"Found task {task_id} in drafts with kind: {kind}, reason_str: {reason_str}, has_url: {bool(url)}")
+                                debug_logger.log_info(
+                                    f"Found task {task_id} in drafts with kind: {kind}, reason_str: {reason_str}, "
+                                    f"error_reason: {error_reason}, has_url: {bool(url)}"
+                                )
                                 await self._record_task_event(
                                     task_id,
                                     token_id,
@@ -1287,12 +1332,9 @@ class GenerationHandler:
                                     },
                                 )
 
-                                # Check if content violates policy
-                                # Violation indicators: kind is violation type, or has reason_str, or missing video URL
                                 is_violation = (
-                                    kind == "sora_content_violation" or
-                                    (reason_str and reason_str.strip()) or  # Has non-empty reason
-                                    not url  # No video URL means generation failed
+                                    kind == "sora_content_violation"
+                                    or bool(reason_str and reason_str.strip())
                                 )
 
                                 if is_violation:
@@ -1324,6 +1366,30 @@ class GenerationHandler:
                                         yield "data: [DONE]\n\n"
 
                                     # Stop polling immediately
+                                    return
+
+                                if not url:
+                                    error_message = (
+                                        f"Upstream generation failed: {error_reason or reason_str or kind or 'draft_missing_url'}"
+                                    )
+                                    debug_logger.log_error(
+                                        error_message=error_message,
+                                        status_code=500,
+                                        response_text=json.dumps(item)
+                                    )
+                                    await self.db.update_task(task_id, "failed", last_progress, error_message=error_message)
+                                    if token_id and self.concurrency_manager:
+                                        await self.concurrency_manager.release_video(token_id)
+                                        debug_logger.log_info(f"Released concurrency slot for token {token_id} due to upstream draft failure")
+                                    if stream:
+                                        yield self._format_stream_chunk(
+                                            reasoning_content=f"**Upstream Generation Failed**\n\n{error_message}\n"
+                                        )
+                                        yield self._format_stream_chunk(
+                                            content=f"❌ 生成失败: {error_message}",
+                                            finish_reason="STOP"
+                                        )
+                                        yield "data: [DONE]\n\n"
                                     return
 
                                 # Check if watermark-free mode is enabled
@@ -1816,8 +1882,14 @@ class GenerationHandler:
         await self.db.update_task(task_id, "failed", 0, error_message=f"Generation timeout after {timeout} seconds")
         raise Exception(f"Upstream API timeout: Generation exceeded {timeout} seconds limit")
     
-    def _format_stream_chunk(self, content: str = None, reasoning_content: str = None,
-                            finish_reason: str = None, is_first: bool = False) -> str:
+    def _format_stream_chunk(
+        self,
+        content: str = None,
+        reasoning_content: str = None,
+        finish_reason: str = None,
+        is_first: bool = False,
+        output: list = None,
+    ) -> str:
         """Format streaming response chunk
 
         Args:
@@ -1825,6 +1897,7 @@ class GenerationHandler:
             reasoning_content: Thinking/reasoning process content
             finish_reason: Finish reason (e.g., "STOP")
             is_first: Whether this is the first chunk (includes role)
+            output: Optional structured output payload for task metadata
         """
         chunk_id = f"chatcmpl-{int(datetime.now().timestamp() * 1000)}"
 
@@ -1844,6 +1917,9 @@ class GenerationHandler:
             delta["reasoning_content"] = reasoning_content
         else:
             delta["reasoning_content"] = None
+
+        if output is not None:
+            delta["output"] = output
 
         delta["tool_calls"] = None
 

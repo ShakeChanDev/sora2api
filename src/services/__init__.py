@@ -10,6 +10,7 @@ from .browser_provider import BrowserProvider
 from .nst_browser_provider import NSTBrowserProvider
 from .mutation_executor import MutationExecutor
 from .polling_client import PollingClient
+from .reference_service import ReferenceService
 
 __all__ = [
     "TokenManager",
@@ -23,5 +24,6 @@ __all__ = [
     "NSTBrowserProvider",
     "MutationExecutor",
     "PollingClient",
+    "ReferenceService",
 ]
 

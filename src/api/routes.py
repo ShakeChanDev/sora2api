@@ -21,6 +21,16 @@ def set_generation_handler(handler: GenerationHandler):
     global generation_handler
     generation_handler = handler
 
+
+def _references_supported(model_config: dict, remix_target_id: str = "", video_data: str = "") -> bool:
+    """Whether the current request supports references."""
+    return (
+        model_config.get("type") == "video"
+        and model_config.get("mode") != "video_extension"
+        and not remix_target_id
+        and not video_data
+    )
+
 def _extract_remix_id(text: str) -> str:
     """Extract remix ID from text
 
@@ -90,7 +100,7 @@ async def create_chat_completion(
             method="POST",
             url="/v1/chat/completions",
             headers=dict(http_request.headers) if http_request else {},
-            body=request.dict(),
+            body=request.model_dump(),
             source="Client"
         )
 
@@ -160,6 +170,18 @@ async def create_chat_completion(
         model_config = MODEL_CONFIG[request.model]
         is_video_model = model_config["type"] in ["video", "avatar_create"]
 
+        if request.references is not None and not _references_supported(model_config, remix_target_id or "", video_data or ""):
+            raise HTTPException(
+                status_code=400,
+                detail="references are only supported for standard video and storyboard generation",
+            )
+        if request.references is not None and _references_supported(model_config, remix_target_id or "", video_data or ""):
+            try:
+                if generation_handler and generation_handler.reference_service:
+                    await generation_handler.reference_service.validate_reference_ids(request.references)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
         # For video models with video parameter, we need streaming
         if is_video_model and (video_data or remix_target_id):
             if not request.stream:
@@ -171,6 +193,7 @@ async def create_chat_completion(
                     image=image_data,
                     video=video_data,
                     remix_target_id=remix_target_id,
+                    references=request.references,
                     stream=False
                 ):
                     result = chunk
@@ -218,6 +241,7 @@ async def create_chat_completion(
                         image=image_data,
                         video=video_data,
                         remix_target_id=remix_target_id,
+                        references=request.references,
                         stream=True
                     ):
                         yield chunk
@@ -265,6 +289,7 @@ async def create_chat_completion(
                 image=image_data,
                 video=video_data,
                 remix_target_id=remix_target_id,
+                references=request.references,
                 stream=False
             ):
                 result = chunk
@@ -302,6 +327,31 @@ async def create_chat_completion(
                     status_code=500,
                     content=error_response
                 )
+
+    except HTTPException as e:
+        duration_ms = (time.time() - start_time) * 1000
+        error_response = {
+            "error": {
+                "message": e.detail,
+                "type": "invalid_request_error" if e.status_code == 400 else "server_error",
+                "param": None,
+                "code": None
+            }
+        }
+        debug_logger.log_error(
+            error_message=str(e.detail),
+            status_code=e.status_code,
+            response_text=str(e.detail),
+            source="Client"
+        )
+        debug_logger.log_response(
+            status_code=e.status_code,
+            headers={"Content-Type": "application/json"},
+            body=error_response,
+            duration_ms=duration_ms,
+            source="Client"
+        )
+        return JSONResponse(status_code=e.status_code, content=error_response)
 
     except Exception as e:
         # Return OpenAI-compatible error format

@@ -22,6 +22,7 @@ from .services.browser_runtime import BrowserRuntime
 from .services.nst_browser_provider import NSTBrowserProvider
 from .services.mutation_executor import MutationExecutor
 from .services.polling_client import PollingClient
+from .services.reference_service import ReferenceService
 from .api import routes as api_routes
 from .api import admin as admin_routes
 
@@ -55,11 +56,29 @@ browser_provider = NSTBrowserProvider() if config.browser_provider == "nst" else
 mutation_executor = MutationExecutor(db, browser_provider, browser_runtime, proxy_manager) if browser_provider else MutationExecutor(db, None, browser_runtime, proxy_manager)
 sora_client = SoraClient(proxy_manager, db=db, mutation_executor=mutation_executor)
 polling_client = PollingClient(db, proxy_manager, mutation_executor)
-generation_handler = GenerationHandler(sora_client, token_manager, load_balancer, db, proxy_manager, concurrency_manager, polling_client=polling_client)
+reference_service = ReferenceService(db, sora_client)
+generation_handler = GenerationHandler(
+    sora_client,
+    token_manager,
+    load_balancer,
+    db,
+    proxy_manager,
+    concurrency_manager,
+    polling_client=polling_client,
+    reference_service=reference_service,
+)
 
 # Set dependencies for route modules
 api_routes.set_generation_handler(generation_handler)
-admin_routes.set_dependencies(token_manager, proxy_manager, db, generation_handler, concurrency_manager, scheduler)
+admin_routes.set_dependencies(
+    token_manager,
+    proxy_manager,
+    db,
+    generation_handler,
+    concurrency_manager,
+    scheduler,
+    reference_service,
+)
 
 # Include routers
 app.include_router(api_routes.router)
@@ -74,6 +93,11 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 tmp_dir = Path(__file__).parent.parent / "tmp"
 tmp_dir.mkdir(exist_ok=True)
 app.mount("/tmp", StaticFiles(directory=str(tmp_dir)), name="tmp")
+
+# Persistent local reference assets
+reference_assets_dir = Path(__file__).parent.parent / "data" / "reference_assets"
+reference_assets_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/reference-assets", StaticFiles(directory=str(reference_assets_dir)), name="reference-assets")
 
 # Frontend routes
 @app.get("/", response_class=HTMLResponse)

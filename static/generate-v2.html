@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sora2 生成面板 v2</title>
+  <style>
+    :root {
+      --bg: radial-gradient(circle at top left, #f7fbff 0%, #eff6ff 34%, #f8fafc 100%);
+      --card: rgba(255, 255, 255, 0.88);
+      --border: rgba(148, 163, 184, 0.28);
+      --border-strong: rgba(148, 163, 184, 0.42);
+      --text: #0f172a;
+      --muted: #475569;
+      --muted-soft: #64748b;
+      --accent: #2563eb;
+      --accent-strong: #1d4ed8;
+      --accent-soft: rgba(37, 99, 235, 0.08);
+      --success: #16a34a;
+      --warning: #d97706;
+      --danger: #dc2626;
+      --shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
+      --radius: 22px;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; min-height: 100%; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+
+    .page {
+      width: 100%;
+      padding: 18px 18px 24px;
+    }
+
+    .shell {
+      max-width: 1380px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .hero {
+      border: 1px solid rgba(59, 130, 246, 0.12);
+      border-radius: 28px;
+      padding: 22px 24px;
+      background:
+        radial-gradient(circle at 85% 10%, rgba(59, 130, 246, 0.14), transparent 28%),
+        radial-gradient(circle at 15% 20%, rgba(14, 165, 233, 0.12), transparent 24%),
+        linear-gradient(135deg, rgba(255,255,255,0.95), rgba(248,250,252,0.92));
+      box-shadow: var(--shadow);
+    }
+
+    .hero-top {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .hero h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 6px 12px;
+      background: rgba(37, 99, 235, 0.1);
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+      max-width: 900px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.85fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .card {
+      background: var(--card);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    .composer {
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .card-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .card-title h2,
+    .tasks-head h2 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+
+    .card-title p,
+    .tasks-head p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .defaults-note {
+      font-size: 12px;
+      color: var(--muted-soft);
+      background: rgba(15, 23, 42, 0.04);
+      border-radius: 999px;
+      padding: 6px 10px;
+      white-space: nowrap;
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .field,
+    .section {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    label {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .hint {
+      font-size: 12px;
+      color: var(--muted-soft);
+      line-height: 1.5;
+    }
+
+    input[type="text"],
+    input[type="password"],
+    select,
+    textarea,
+    .upload-box {
+      width: 100%;
+      border: 1px solid var(--border-strong);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.88);
+      color: var(--text);
+      font: inherit;
+    }
+
+    input[type="text"],
+    input[type="password"],
+    select {
+      height: 46px;
+      padding: 0 14px;
+    }
+
+    textarea {
+      min-height: 180px;
+      resize: vertical;
+      padding: 14px;
+      line-height: 1.7;
+    }
+
+    .media-row {
+      display: grid;
+      grid-template-columns: 1fr 200px;
+      gap: 14px;
+      align-items: start;
+    }
+
+    .upload-box {
+      position: relative;
+      min-height: 128px;
+      padding: 16px;
+      border-style: dashed;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+      background: linear-gradient(135deg, rgba(37,99,235,0.05), rgba(255,255,255,0.9));
+    }
+
+    .upload-box input[type="file"] {
+      width: 100%;
+    }
+
+    .preview-frame {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgba(255,255,255,0.78);
+      min-height: 200px;
+      padding: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .preview-frame img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border-radius: 14px;
+    }
+
+    .preview-empty {
+      color: var(--muted-soft);
+      font-size: 12px;
+      text-align: center;
+      line-height: 1.6;
+    }
+
+    .refs-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .counter {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      background: rgba(37, 99, 235, 0.08);
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 10px;
+    }
+
+    .refs-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .ref-card {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      overflow: hidden;
+      background: rgba(255,255,255,0.92);
+      cursor: pointer;
+      transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    .ref-card:hover {
+      transform: translateY(-1px);
+      border-color: rgba(37, 99, 235, 0.32);
+    }
+
+    .ref-card.selected {
+      border-color: rgba(37, 99, 235, 0.5);
+      box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
+    }
+
+    .ref-thumb {
+      aspect-ratio: 4 / 3;
+      background: linear-gradient(135deg, rgba(148,163,184,0.15), rgba(226,232,240,0.45));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .ref-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .ref-thumb-empty {
+      color: var(--muted-soft);
+      font-size: 12px;
+    }
+
+    .ref-body {
+      padding: 12px 14px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .ref-main {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .ref-name {
+      font-size: 14px;
+      font-weight: 700;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+
+    .ref-id {
+      font-size: 11px;
+      color: var(--muted-soft);
+      word-break: break-all;
+      line-height: 1.5;
+    }
+
+    .ref-type {
+      border-radius: 999px;
+      padding: 4px 8px;
+      background: rgba(14, 165, 233, 0.1);
+      color: #0369a1;
+      font-size: 11px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .empty-block {
+      border: 1px dashed rgba(148,163,184,0.6);
+      border-radius: 18px;
+      padding: 18px;
+      text-align: center;
+      color: var(--muted-soft);
+      line-height: 1.7;
+      background: rgba(255,255,255,0.72);
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding-top: 4px;
+    }
+
+    .actions-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      height: 44px;
+      padding: 0 16px;
+      border-radius: 14px;
+      border: none;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+      transition: transform 0.16s ease, box-shadow 0.16s ease, opacity 0.16s ease;
+    }
+
+    .btn:disabled {
+      cursor: not-allowed;
+      opacity: 0.62;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .btn-primary {
+      color: #fff;
+      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+      box-shadow: 0 14px 30px rgba(37, 99, 235, 0.24);
+    }
+
+    .btn-secondary {
+      color: var(--text);
+      background: rgba(15, 23, 42, 0.05);
+      border: 1px solid var(--border-strong);
+    }
+
+    .btn:hover:not(:disabled) {
+      transform: translateY(-1px);
+    }
+
+    .tasks {
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .tasks-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .task-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .task-card {
+      border: 1px solid rgba(148,163,184,0.2);
+      border-radius: 20px;
+      background: rgba(255,255,255,0.88);
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .task-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .task-title {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .task-name {
+      font-size: 14px;
+      font-weight: 700;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+
+    .task-meta {
+      font-size: 12px;
+      color: var(--muted-soft);
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .status-badge {
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .status-preparing,
+    .status-submitting,
+    .status-generating {
+      background: rgba(37, 99, 235, 0.1);
+      color: var(--accent-strong);
+    }
+
+    .status-success {
+      background: rgba(22, 163, 74, 0.12);
+      color: var(--success);
+    }
+
+    .status-error,
+    .status-interrupted {
+      background: rgba(220, 38, 38, 0.1);
+      color: var(--danger);
+    }
+
+    .progress-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .progress-text {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(148, 163, 184, 0.18);
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #38bdf8, #2563eb);
+      transition: width 0.18s ease;
+    }
+
+    .task-attrs {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .task-attr {
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.04);
+      padding: 10px 12px;
+    }
+
+    .task-attr-label {
+      font-size: 11px;
+      color: var(--muted-soft);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .task-attr-value {
+      font-size: 13px;
+      color: var(--text);
+      word-break: break-word;
+      line-height: 1.5;
+    }
+
+    .task-preview {
+      border-radius: 18px;
+      overflow: hidden;
+      background: rgba(15,23,42,0.06);
+      min-height: 180px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .task-preview video,
+    .task-preview img {
+      width: 100%;
+      display: block;
+      max-height: 340px;
+      object-fit: cover;
+      background: #000;
+    }
+
+    .task-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .link-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 38px;
+      padding: 0 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      background: rgba(255,255,255,0.94);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .toast-host {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 40;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: none;
+    }
+
+    .toast {
+      min-width: 240px;
+      max-width: 360px;
+      border-radius: 16px;
+      padding: 12px 14px;
+      color: #fff;
+      font-size: 13px;
+      line-height: 1.5;
+      box-shadow: 0 18px 35px rgba(15,23,42,0.18);
+      pointer-events: auto;
+      animation: toast-in 0.18s ease;
+    }
+
+    .toast-info { background: #2563eb; }
+    .toast-success { background: #16a34a; }
+    .toast-warn { background: #d97706; }
+    .toast-error { background: #dc2626; }
+
+    @keyframes toast-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 1080px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 760px) {
+      .page { padding: 14px; }
+      .hero { padding: 18px; }
+      .hero h1 { font-size: 24px; }
+      .field-grid,
+      .media-row,
+      .refs-grid,
+      .task-attrs { grid-template-columns: 1fr; }
+      .composer,
+      .tasks { padding: 16px; }
+      .actions { align-items: stretch; }
+      .actions-left { width: 100%; }
+      .btn { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="shell">
+      <section class="hero">
+        <div class="hero-top">
+          <span class="badge">V2</span>
+          <h1>单次视频生成面板</h1>
+        </div>
+        <p>面向单次视频场景，默认走当前后台 API Key 与站点地址，支持提示词、首帧图和本地 References 组合提交。</p>
+      </section>
+
+      <div class="layout">
+        <section class="card composer">
+          <div class="card-title">
+            <div>
+              <h2>提交参数</h2>
+              <p>仅支持单次视频模型；不包含旧版分镜、多提示、角色卡和图片模式。</p>
+            </div>
+            <div id="defaultsNote" class="defaults-note">正在读取后台默认值…</div>
+          </div>
+
+          <div class="field-grid">
+            <div class="field">
+              <label for="apiKey">API Key</label>
+              <input id="apiKey" type="password" autocomplete="off" placeholder="登录管理后台后会自动填充">
+              <div class="hint">每次页面加载会优先读取当前后台配置，你也可以临时改成别的 key。</div>
+            </div>
+            <div class="field">
+              <label for="baseUrl">服务器地址</label>
+              <input id="baseUrl" type="text" autocomplete="off" placeholder="默认当前站点 origin">
+              <div class="hint">默认使用当前管理后台所在地址，可临时改为别的 Sora2API 服务地址。</div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="model">模型</label>
+            <select id="model">
+              <option value="sora2-landscape-25s">横屏视频 25 秒</option>
+              <option value="sora2-landscape-15s">横屏视频 15 秒</option>
+              <option value="sora2-landscape-10s">横屏视频 10 秒</option>
+              <option value="sora2-portrait-25s">竖屏视频 25 秒</option>
+              <option value="sora2-portrait-15s">竖屏视频 15 秒</option>
+              <option value="sora2-portrait-10s" selected>竖屏视频 10 秒</option>
+              <option value="sora2pro-landscape-25s">横屏视频 25 秒 (Pro)</option>
+              <option value="sora2pro-landscape-15s">横屏视频 15 秒 (Pro)</option>
+              <option value="sora2pro-landscape-10s">横屏视频 10 秒 (Pro)</option>
+              <option value="sora2pro-portrait-25s">竖屏视频 25 秒 (Pro)</option>
+              <option value="sora2pro-portrait-15s">竖屏视频 15 秒 (Pro)</option>
+              <option value="sora2pro-portrait-10s">竖屏视频 10 秒 (Pro)</option>
+              <option value="sora2pro-hd-landscape-15s">横屏视频 15 秒 (Pro HD)</option>
+              <option value="sora2pro-hd-landscape-10s">横屏视频 10 秒 (Pro HD)</option>
+              <option value="sora2pro-hd-portrait-15s">竖屏视频 15 秒 (Pro HD)</option>
+              <option value="sora2pro-hd-portrait-10s">竖屏视频 10 秒 (Pro HD)</option>
+            </select>
+            <div class="hint">默认是标准版竖屏 10 秒；本页不展示图片模型和角色卡模型。</div>
+          </div>
+
+          <div class="field">
+            <label for="prompt">提示词</label>
+            <textarea id="prompt" placeholder="可以只写提示词，也可以搭配首帧图和 References 一起生成。英文描述通常更稳定。"></textarea>
+            <div class="hint">提示词、首帧图、References 三者至少要有一个。</div>
+          </div>
+
+          <div class="section">
+            <label for="imageInput">首帧图（可选，仅 1 张）</label>
+            <div class="media-row">
+              <div class="upload-box">
+                <input id="imageInput" type="file" accept="image/*">
+                <div class="hint">只接受图片文件，用于图生视频首帧；不支持视频或混合素材。</div>
+                <div class="actions-left">
+                  <button id="clearImageBtn" type="button" class="btn btn-secondary">清空图片</button>
+                </div>
+              </div>
+              <div class="preview-frame">
+                <img id="imagePreview" alt="首帧预览" hidden>
+                <div id="imagePreviewEmpty" class="preview-empty">未选择首帧图<br>提交时会走纯提示词 / References 路径</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="refs-head">
+              <div>
+                <label>References</label>
+                <div class="hint">点击卡片进行选择，最多 5 个；未选择时不会把 `references` 字段发给后端。</div>
+              </div>
+              <div id="referenceCounter" class="counter">已选 0 / 5</div>
+            </div>
+            <div id="referencesState" class="empty-block">正在加载 reference 列表…</div>
+            <div id="referenceGrid" class="refs-grid" hidden></div>
+          </div>
+
+          <div class="actions">
+            <div class="actions-left">
+              <button id="submitBtn" type="button" class="btn btn-primary">开始生成</button>
+              <button id="clearBtn" type="button" class="btn btn-secondary">清空输入</button>
+            </div>
+            <div class="hint">任务结果仅在当前会话内保留，不会接入旧版完整任务系统。</div>
+          </div>
+        </section>
+
+        <aside class="card tasks">
+          <div class="tasks-head">
+            <div>
+              <h2>本页任务</h2>
+              <p>展示当前 v2 页提交的轻量任务状态与结果，不写入旧版任务抽屉交互。</p>
+            </div>
+            <div class="hint">刷新页面后，未完成任务会标记为中断。</div>
+          </div>
+          <div id="taskList" class="task-list">
+            <div class="empty-block">还没有提交任务。填好提示词、首帧图或 References 后开始生成。</div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastHost" class="toast-host"></div>
+  <script src="/static/js/generate-v2.js"></script>
+</body>
+</html>

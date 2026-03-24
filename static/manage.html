@@ -65,9 +65,11 @@
         <div class="border-b border-border mb-6">
             <nav class="flex space-x-8">
                 <button onclick="switchTab('tokens')" id="tabTokens" class="tab-btn border-b-2 border-primary text-sm font-medium py-3 px-1">Token 管理</button>
+                <button onclick="switchTab('references')" id="tabReferences" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">References</button>
                 <button onclick="switchTab('settings')" id="tabSettings" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">系统配置</button>
                 <button onclick="switchTab('logs')" id="tabLogs" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">请求日志</button>
                 <button onclick="switchTab('generate')" id="tabGenerate" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">生成面板</button>
+                <button onclick="switchTab('generateV2')" id="tabGenerateV2" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">生成面板 v2</button>
             </nav>
         </div>
 
@@ -349,6 +351,28 @@
                 </div>
                 <!-- 分页控件 -->
                 <div id="paginationContainer"></div>
+            </div>
+        </div>
+
+        <!-- References 面板 -->
+        <div id="panelReferences" class="hidden">
+            <div class="rounded-lg border border-border bg-background">
+                <div class="flex items-center justify-between gap-4 p-4 border-b border-border">
+                    <div>
+                        <h3 class="text-lg font-semibold">Reference 主库</h3>
+                        <p class="text-sm text-muted-foreground mt-1">管理本地 reference 主库。生成时会自动同步到被选中的 Sora 账号。</p>
+                    </div>
+                    <button onclick="openReferenceModal()" class="inline-flex items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 h-9 px-4">
+                        <svg class="h-4 w-4 mr-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="12" y1="5" x2="12" y2="19"/>
+                            <line x1="5" y1="12" x2="19" y2="12"/>
+                        </svg>
+                        新建 Reference
+                    </button>
+                </div>
+                <div id="referencesGrid" class="grid gap-4 p-4 md:grid-cols-2 xl:grid-cols-3">
+                    <div class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">加载中...</div>
+                </div>
             </div>
         </div>
 
@@ -739,6 +763,11 @@
         <!-- 生成面板（单层嵌入，铺满主内容宽度） -->
         <div id="panelGenerate" class="hidden" style="background: #ffffff;">
             <iframe id="generateFrame" src="/static/generate.html" class="w-full" style="border: 0; background: #ffffff; display:block; width:100%; height: 800px;" loading="lazy"></iframe>
+        </div>
+
+        <!-- 生成面板 v2（轻量单次视频） -->
+        <div id="panelGenerateV2" class="hidden" style="background: #ffffff;">
+            <iframe id="generateFrameV2" src="/static/generate-v2.html" class="w-full" style="border: 0; background: #ffffff; display:block; width:100%; height: 880px;" loading="lazy"></iframe>
         </div>
 
         <!-- 日志详情模态框 -->
@@ -1135,12 +1164,76 @@
         </div>
     </div>
 
+    <div id="referenceModal" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+        <div class="bg-background rounded-lg border border-border w-full max-w-2xl shadow-xl">
+            <div class="flex items-center justify-between p-5 border-b border-border">
+                <div>
+                    <h3 id="referenceModalTitle" class="text-lg font-semibold">新建 Reference</h3>
+                    <p class="text-sm text-muted-foreground mt-1">图片会持久化保存，生成时自动同步到所选账号。</p>
+                </div>
+                <button onclick="closeReferenceModal()" class="text-muted-foreground hover:text-foreground">
+                    <svg class="h-3.5 w-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="p-5 space-y-4">
+                <input type="hidden" id="referenceEditId">
+                <div class="grid gap-4 md:grid-cols-2">
+                    <div>
+                        <label class="text-sm font-medium mb-2 block">名称</label>
+                        <input id="referenceName" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="例如：衣服">
+                    </div>
+                    <div>
+                        <label class="text-sm font-medium mb-2 block">类型</label>
+                        <select id="referenceType" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm">
+                            <option value="character">character</option>
+                            <option value="setting">setting</option>
+                            <option value="style">style</option>
+                            <option value="other">other</option>
+                        </select>
+                    </div>
+                </div>
+                <div>
+                    <label class="text-sm font-medium mb-2 block">描述</label>
+                    <textarea id="referenceDescription" rows="4" class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm resize-none" placeholder="可选，描述这个 reference 的用途和素材内容"></textarea>
+                </div>
+                <div class="grid gap-4 md:grid-cols-[1.2fr,0.8fr]">
+                    <div>
+                        <label class="text-sm font-medium mb-2 block">图片</label>
+                        <input id="referenceImage" type="file" accept="image/*" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" onchange="previewReferenceImage(this)">
+                        <p id="referenceImageHint" class="text-xs text-muted-foreground mt-2">创建时必填，编辑时可选替换。</p>
+                    </div>
+                    <div>
+                        <label class="text-sm font-medium mb-2 block">预览</label>
+                        <div class="rounded-lg border border-border bg-muted/30 h-40 flex items-center justify-center overflow-hidden">
+                            <img id="referencePreview" src="" alt="reference preview" class="hidden h-full w-full object-cover">
+                            <span id="referencePreviewEmpty" class="text-xs text-muted-foreground">暂无预览</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="flex items-center justify-end gap-3 p-5 border-t border-border">
+                <button onclick="closeReferenceModal()" class="inline-flex items-center justify-center rounded-md border border-input bg-background hover:bg-accent h-9 px-5">取消</button>
+                <button id="referenceSubmitBtn" onclick="submitReference()" class="inline-flex items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 h-9 px-5">
+                    <span id="referenceSubmitText">保存</span>
+                    <svg id="referenceSubmitSpinner" class="hidden animate-spin h-4 w-4 ml-2" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let allTokens=[],currentPage=1,pageSize=20,selectedTokenIds=new Set(),currentStatusFilter='';
-        let currentEditTokenDetails=null;
+        let currentEditTokenDetails=null,allReferences=[],currentReferenceId=null;
         const $=(id)=>document.getElementById(id),
         checkAuth=()=>{const t=localStorage.getItem('adminToken');return t||(location.href='/login',null),t},
         apiRequest=async(url,opts={})=>{const t=checkAuth();if(!t)return null;const r=await fetch(url,{...opts,headers:{...opts.headers,Authorization:`Bearer ${t}`,'Content-Type':'application/json'}});return r.status===401?(localStorage.removeItem('adminToken'),location.href='/login',null):r},
+        apiFormRequest=async(url,opts={})=>{const t=checkAuth();if(!t)return null;const r=await fetch(url,{...opts,headers:{...opts.headers,Authorization:`Bearer ${t}`}});return r.status===401?(localStorage.removeItem('adminToken'),location.href='/login',null):r},
         // 获取token的状态文本和样式
         getTokenStatus=(token)=>{if(token.is_active){return{text:'活跃',class:'bg-green-50 text-green-700'}}const reason=token.disabled_reason;if(reason==='token_invalid'||reason==='expired'){return{text:'失效',class:'bg-gray-100 text-gray-700'}}if(reason==='manual'||reason==='error_limit'){return{text:'禁用',class:'bg-gray-100 text-gray-700'}}return{text:'禁用',class:'bg-gray-100 text-gray-700'}},
         loadStats=async()=>{try{const r=await apiRequest('/api/stats');if(!r)return;const d=await r.json();$('statTotal').textContent=d.total_tokens||0;$('statActive').textContent=d.active_tokens||0;$('statImages').textContent=(d.today_images||0)+'/'+(d.total_images||0);$('statVideos').textContent=(d.today_videos||0)+'/'+(d.total_videos||0);$('statErrors').textContent=(d.today_errors||0)+'/'+(d.total_errors||0)}catch(e){console.error('加载统计失败:',e)}},
@@ -1227,6 +1320,14 @@
         clearAllLogs=async()=>{if(!confirm('确定要清空所有日志吗？此操作不可恢复！'))return;try{const r=await apiRequest('/api/logs',{method:'DELETE'});if(!r)return;const d=await r.json();if(d.success){showToast('日志已清空','success');await loadLogs()}else{showToast('清空失败: '+(d.message||'未知错误'),'error')}}catch(e){showToast('清空失败: '+e.message,'error')}},
         cancelTask=async(taskId)=>{if(!confirm('确定要终止这个任务吗？'))return;try{const r=await apiRequest(`/api/tasks/${taskId}/cancel`,{method:'POST'});if(!r)return;const d=await r.json();if(d.success){showToast('任务已终止','success');await loadLogs()}else{showToast('终止失败: '+(d.message||'未知错误'),'error')}}catch(e){showToast('终止失败: '+e.message,'error')}},
         showToast=(m,t='info')=>{const d=document.createElement('div'),bc={success:'bg-green-600',error:'bg-destructive',info:'bg-primary'};d.className=`fixed bottom-4 right-4 ${bc[t]||bc.info} text-white px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium z-50 animate-slide-up`;d.textContent=m;document.body.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.parentNode&&document.body.removeChild(d),300)},2000)},
+        renderReferences=()=>{const g=$('referencesGrid');if(!g)return;if(!allReferences.length){g.innerHTML='<div class="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground md:col-span-2 xl:col-span-3">暂无 reference，先创建一个带图片的主库条目。</div>';return}g.innerHTML=allReferences.map(r=>`<div class="rounded-lg border border-border bg-background overflow-hidden"><div class="aspect-[4/3] bg-muted/30">${r.preview_url?`<img src="${r.preview_url}" alt="${r.name}" class="h-full w-full object-cover" onerror="this.closest('div').innerHTML='<div class=&quot;h-full w-full flex items-center justify-center text-xs text-muted-foreground&quot;>预览加载失败</div>'"/>`:'<div class="h-full w-full flex items-center justify-center text-xs text-muted-foreground">暂无预览</div>'}</div><div class="p-4"><div class="flex items-start justify-between gap-3"><div class="min-w-0"><div class="font-semibold truncate">${r.name}</div><div class="text-xs text-muted-foreground mt-1">${r.reference_id}</div></div><span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-blue-50 text-blue-700">${r.type}</span></div>${r.description?`<p class="text-sm text-muted-foreground mt-3 line-clamp-3">${r.description}</p>`:'<p class="text-sm text-muted-foreground mt-3">无描述</p>'}<div class="mt-4 flex gap-2"><button onclick="openReferenceModal('${r.reference_id}')" class="flex-1 inline-flex items-center justify-center rounded-md border border-input bg-background hover:bg-accent h-8 px-3 text-sm">编辑</button><button onclick="deleteReference('${r.reference_id}')" class="flex-1 inline-flex items-center justify-center rounded-md border border-destructive text-destructive hover:bg-destructive hover:text-white h-8 px-3 text-sm transition-colors">删除</button></div></div></div>`).join('')},
+        loadReferences=async()=>{try{const r=await apiRequest('/api/references');if(!r)return;if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'加载 reference 失败')}allReferences=await r.json();renderReferences()}catch(e){const g=$('referencesGrid');if(g)g.innerHTML=`<div class="rounded-lg border border-dashed border-destructive p-8 text-center text-sm text-destructive md:col-span-2 xl:col-span-3">${e.message}</div>`;showToast('加载 reference 失败: '+e.message,'error')}},
+        setReferencePreview=(src)=>{const img=$('referencePreview'),empty=$('referencePreviewEmpty');if(!img||!empty)return;if(src){img.src=src;img.classList.remove('hidden');empty.classList.add('hidden')}else{img.src='';img.classList.add('hidden');empty.classList.remove('hidden')}},
+        previewReferenceImage=(input)=>{const file=input&&input.files&&input.files[0];if(!file)return;const reader=new FileReader();reader.onload=e=>setReferencePreview(e.target&&e.target.result?String(e.target.result):'');reader.readAsDataURL(file)},
+        openReferenceModal=(referenceId=null)=>{currentReferenceId=referenceId;const editing=!!referenceId;const current=editing?allReferences.find(r=>r.reference_id===referenceId):null;$('referenceModalTitle').textContent=editing?'编辑 Reference':'新建 Reference';$('referenceSubmitText').textContent=editing?'保存修改':'创建 Reference';$('referenceEditId').value=editing&&current?current.reference_id:'';$('referenceName').value=editing&&current?current.name:'';$('referenceType').value=editing&&current?current.type:'other';$('referenceDescription').value=editing&&current&&current.description?current.description:'';$('referenceImage').value='';$('referenceImageHint').textContent=editing?'不上传则保留现有图片。':'创建时图片必填。';setReferencePreview(editing&&current?current.preview_url:'');$('referenceModal').classList.remove('hidden')},
+        closeReferenceModal=()=>{$('referenceModal').classList.add('hidden');currentReferenceId=null;$('referenceImage').value='';setReferencePreview('')},
+        submitReference=async()=>{const editing=!!currentReferenceId,name=$('referenceName').value.trim(),type=$('referenceType').value,description=$('referenceDescription').value.trim(),imageInput=$('referenceImage'),file=imageInput.files&&imageInput.files[0]?imageInput.files[0]:null;if(!name)return showToast('请输入 reference 名称','error');if(!editing&&!file)return showToast('创建 reference 时必须上传图片','error');const body=new FormData();body.append('name',name);body.append('type',type);body.append('description',description);if(file)body.append('image',file);const btn=$('referenceSubmitBtn'),text=$('referenceSubmitText'),spinner=$('referenceSubmitSpinner');btn.disabled=true;spinner.classList.remove('hidden');try{const url=editing?`/api/references/${currentReferenceId}`:'/api/references';const r=await apiFormRequest(url,{method:editing?'PUT':'POST',body});if(!r){btn.disabled=false;spinner.classList.add('hidden');return}const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'保存 reference 失败');closeReferenceModal();await loadReferences();showToast(editing?'Reference 更新成功':'Reference 创建成功','success')}catch(e){showToast((editing?'更新':'创建')+' reference 失败: '+e.message,'error')}finally{btn.disabled=false;spinner.classList.add('hidden')}},
+        deleteReference=async(referenceId)=>{const current=allReferences.find(r=>r.reference_id===referenceId);if(!confirm(`确定要删除 reference ${current?current.name:referenceId} 吗？`))return;try{const r=await apiRequest(`/api/references/${referenceId}`,{method:'DELETE'});if(!r)return;const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'删除 reference 失败');await loadReferences();showToast('Reference 删除成功','success')}catch(e){showToast('删除 reference 失败: '+e.message,'error')}},
         logout=()=>{if(!confirm('确定要退出登录吗?'))return;localStorage.removeItem('adminToken');location.href='/login'},
         loadCharacters=async()=>{try{const r=await apiRequest('/api/characters');if(!r)return;const d=await r.json();const g=$('charactersGrid');if(!d||d.length===0){g.innerHTML='<div class="col-span-full text-center py-8 text-muted-foreground">暂无角色卡</div>';return}g.innerHTML=d.map(c=>`<div class="rounded-lg border border-border bg-background p-4"><div class="flex items-start gap-3"><img src="${c.avatar_path||'/static/favicon.ico'}" class="h-14 w-14 rounded-lg object-cover" onerror="this.src='/static/favicon.ico'"/><div class="flex-1 min-w-0"><div class="font-semibold truncate">${c.display_name||c.username}</div><div class="text-xs text-muted-foreground truncate">@${c.username}</div>${c.description?`<div class="text-xs text-muted-foreground mt-1 line-clamp-2">${c.description}</div>`:''}</div></div><div class="mt-3 flex gap-2"><button onclick="deleteCharacter(${c.id})" class="flex-1 inline-flex items-center justify-center rounded-md border border-destructive text-destructive hover:bg-destructive hover:text-white h-8 px-3 text-sm transition-colors">删除</button></div></div>`).join('')}catch(e){showToast('加载失败: '+e.message,'error')}},
         deleteCharacter=async(id)=>{if(!confirm('确定要删除这个角色卡吗?'))return;try{const r=await apiRequest(`/api/characters/${id}`,{method:'DELETE'});if(!r)return;const d=await r.json();if(d.success){showToast('删除成功','success');await loadCharacters()}else{showToast('删除失败','error')}}catch(e){showToast('删除失败: '+e.message,'error')}},
@@ -1238,17 +1339,17 @@
         togglePowFields=()=>{const mode=$('cfgPowMode').value;const externalFields=$('powExternalFields');if(externalFields){externalFields.style.display=mode==='external'?'block':'none'}},
         togglePowProxyFields=()=>{const enabled=$('cfgPowProxyEnabled').checked;const proxyUrlField=$('powProxyUrlField');if(proxyUrlField){proxyUrlField.style.display=enabled?'block':'none'}},
         togglePowServiceFields=()=>{togglePowFields()},
-        switchTab=t=>{const cap=n=>n.charAt(0).toUpperCase()+n.slice(1);['tokens','settings','logs','generate'].forEach(n=>{const active=n===t;$(`panel${cap(n)}`).classList.toggle('hidden',!active);$(`tab${cap(n)}`).classList.toggle('border-primary',active);$(`tab${cap(n)}`).classList.toggle('text-primary',active);$(`tab${cap(n)}`).classList.toggle('border-transparent',!active);$(`tab${cap(n)}`).classList.toggle('text-muted-foreground',!active)});if(t==='settings'){loadAdminConfig();loadProxyConfig();loadPowProxyConfig();loadPowServiceConfig();loadWatermarkFreeConfig();loadCacheConfig();loadGenerationTimeout();loadATAutoRefreshConfig();loadCallLogicConfig()}else if(t==='logs'){loadLogs()}};
+        switchTab=t=>{const cap=n=>n.charAt(0).toUpperCase()+n.slice(1);['tokens','references','settings','logs','generate','generateV2'].forEach(n=>{const active=n===t;$(`panel${cap(n)}`).classList.toggle('hidden',!active);$(`tab${cap(n)}`).classList.toggle('border-primary',active);$(`tab${cap(n)}`).classList.toggle('text-primary',active);$(`tab${cap(n)}`).classList.toggle('border-transparent',!active);$(`tab${cap(n)}`).classList.toggle('text-muted-foreground',!active)});if(t==='references'){loadReferences()}else if(t==='settings'){loadAdminConfig();loadProxyConfig();loadPowProxyConfig();loadPowServiceConfig();loadWatermarkFreeConfig();loadCacheConfig();loadGenerationTimeout();loadATAutoRefreshConfig();loadCallLogicConfig()}else if(t==='logs'){loadLogs()}};
         // 自适应生成面板 iframe 高度
         window.addEventListener('message', (event) => {
             const data = event.data || {};
-            if (data.type === 'sora-generate-height' && typeof data.height === 'number') {
-                const iframe = document.getElementById('generateFrame');
-                if (iframe) {
-                    const nextH = Math.max(560, Math.ceil(data.height) + 8);
-                    iframe.style.height = `${nextH}px`;
-                }
-            }
+            if (data.type !== 'sora-generate-height' || typeof data.height !== 'number') return;
+            const nextH = Math.max(560, Math.ceil(data.height) + 8);
+            const frames = ['generateFrame','generateFrameV2'].map(id=>document.getElementById(id)).filter(Boolean);
+            const matched = frames.find(frame=>frame.contentWindow===event.source);
+            if(matched){matched.style.height=`${nextH}px`;return}
+            const active = frames.find(frame=>!frame.closest('div')?.classList.contains('hidden'));
+            if(active)active.style.height=`${nextH}px`;
         });
         // 点击页面其他地方关闭筛选下拉菜单
         document.addEventListener('click', (e) => {

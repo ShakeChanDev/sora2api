@@ -1099,7 +1099,7 @@ class SoraClient:
         """Make HTTP request with proxy support
 
         Args:
-            method: HTTP method (GET/POST)
+            method: HTTP method (GET/POST/PUT/DELETE)
             endpoint: API endpoint
             token: Access token
             json_data: JSON request body
@@ -1169,6 +1169,10 @@ class SoraClient:
                 response = await session.get(url, **kwargs)
             elif method == "POST":
                 response = await session.post(url, **kwargs)
+            elif method == "PUT":
+                response = await session.put(url, **kwargs)
+            elif method == "DELETE":
+                response = await session.delete(url, **kwargs)
             else:
                 raise ValueError(f"Unsupported method: {method}")
 
@@ -1191,7 +1195,7 @@ class SoraClient:
             )
 
             # Check status
-            if response.status_code not in [200, 201]:
+            if response.status_code not in [200, 201, 204]:
                 # Parse error response
                 error_data = None
                 try:
@@ -1225,6 +1229,8 @@ class SoraClient:
                 )
                 raise Exception(error_msg)
 
+            if response.status_code == 204:
+                return {}
             return response_json if response_json else response.json()
     
     async def get_user_info(self, token: str) -> Dict[str, Any]:
@@ -1276,7 +1282,122 @@ class SoraClient:
             use_image_upload_proxy=True
         )
         return result["id"]
-    
+
+    async def upload_reference_image(
+        self,
+        image_bytes: bytes,
+        token: str,
+        filename: str = "reference.png",
+        token_id: Optional[int] = None,
+    ) -> str:
+        """Upload a reference source image and return asset_pointer."""
+        mime_type = "image/png"
+        lower_name = filename.lower()
+        if lower_name.endswith(".jpg") or lower_name.endswith(".jpeg"):
+            mime_type = "image/jpeg"
+        elif lower_name.endswith(".webp"):
+            mime_type = "image/webp"
+        elif lower_name.endswith(".gif"):
+            mime_type = "image/gif"
+
+        mp = CurlMime()
+        mp.addpart(
+            name="file",
+            content_type=mime_type,
+            filename=filename,
+            data=image_bytes,
+        )
+        mp.addpart(
+            name="use_case",
+            data=b"inpaint_safe",
+        )
+
+        result = await self._make_request(
+            "POST",
+            "/project_y/file/upload",
+            token,
+            multipart=mp,
+            token_id=token_id,
+            use_image_upload_proxy=True,
+        )
+        return result.get("asset_pointer")
+
+    async def get_references(self, token: str, limit: int = 20, token_id: Optional[int] = None) -> Dict[str, Any]:
+        """Get upstream references for the current account."""
+        return await self._make_request(
+            "GET",
+            f"/project_y/references/mine?limit={limit}",
+            token,
+            token_id=token_id,
+        )
+
+    async def create_reference(
+        self,
+        token: str,
+        name: str,
+        description: Optional[str],
+        reference_type: str,
+        asset_pointers: Optional[List[str]] = None,
+        token_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Create an upstream reference."""
+        payload = {
+            "name": name.strip(),
+            "display_name": name.strip(),
+            "description": description.strip() if isinstance(description, str) and description.strip() else None,
+            "type": reference_type,
+            "asset_pointers": list(asset_pointers or []),
+        }
+        return await self._make_request(
+            "POST",
+            "/project_y/references/create",
+            token,
+            json_data=payload,
+            token_id=token_id,
+        )
+
+    async def update_reference(
+        self,
+        token: str,
+        upstream_reference_id: str,
+        name: str,
+        description: Optional[str],
+        reference_type: str,
+        asset_pointers: Optional[List[str]] = None,
+        token_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Update an upstream reference."""
+        payload = {
+            "name": name.strip(),
+            "display_name": name.strip(),
+            "description": description.strip() if isinstance(description, str) and description.strip() else None,
+            "type": reference_type,
+        }
+        if asset_pointers is not None:
+            payload["asset_pointers"] = list(asset_pointers)
+        return await self._make_request(
+            "PUT",
+            f"/project_y/references/{upstream_reference_id}",
+            token,
+            json_data=payload,
+            token_id=token_id,
+        )
+
+    async def delete_reference(
+        self,
+        upstream_reference_id: str,
+        token: str,
+        token_id: Optional[int] = None,
+    ) -> bool:
+        """Delete an upstream reference."""
+        await self._make_request(
+            "DELETE",
+            f"/project_y/references/{upstream_reference_id}",
+            token,
+            token_id=token_id,
+        )
+        return True
+
     async def generate_image(self, prompt: str, token: str, width: int = 360,
                             height: int = 360, media_id: Optional[str] = None, token_id: Optional[int] = None) -> str:
         """Generate image (text-to-image or image-to-image)"""
@@ -1307,7 +1428,8 @@ class SoraClient:
     
     async def generate_video(self, prompt: str, token: str, orientation: str = "landscape",
                             media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None,
-                            model: str = "sy_8", size: str = "small", token_id: Optional[int] = None) -> MutationResult:
+                            model: str = "sy_8", size: str = "small", token_id: Optional[int] = None,
+                            reference_ids: Optional[List[str]] = None) -> MutationResult:
         """Generate video (text-to-video or image-to-video)
 
         Args:
@@ -1320,6 +1442,7 @@ class SoraClient:
             model: Model to use (sy_8 for standard, sy_ore for pro)
             size: Video size (small for standard, large for HD)
             token_id: Token ID for getting token-specific proxy (optional)
+            reference_ids: Optional upstream reference ids to merge into inpaint_items
         """
         if not self.mutation_executor:
             raise RuntimeError("High-risk video submit requires a configured mutation executor")
@@ -1332,6 +1455,7 @@ class SoraClient:
             size=size,
             media_id=media_id,
             style_id=style_id,
+            reference_ids=reference_ids,
         )
     
     async def get_image_tasks(self, token: str, limit: int = 20, token_id: Optional[int] = None) -> Dict[str, Any]:
@@ -1797,7 +1921,8 @@ class SoraClient:
 
     async def generate_storyboard(self, prompt: str, token: str, orientation: str = "landscape",
                                  media_id: Optional[str] = None, n_frames: int = 450,
-                                 style_id: Optional[str] = None, token_id: Optional[int] = None) -> MutationResult:
+                                 style_id: Optional[str] = None, token_id: Optional[int] = None,
+                                 reference_ids: Optional[List[str]] = None) -> MutationResult:
         """Generate video using storyboard mode
 
         Args:
@@ -1807,6 +1932,7 @@ class SoraClient:
             media_id: Optional image media_id for image-to-video
             n_frames: Number of frames
             style_id: Optional style ID
+            reference_ids: Optional upstream reference ids to merge into inpaint_items
 
         Returns:
             MutationResult with task-scoped polling context
@@ -1820,6 +1946,7 @@ class SoraClient:
             media_id=media_id,
             n_frames=n_frames,
             style_id=style_id,
+            reference_ids=reference_ids,
         )
 
     async def enhance_prompt(self, prompt: str, token: str, expansion_level: str = "medium",

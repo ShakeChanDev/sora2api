@@ -21,6 +21,7 @@
 - 🖼️ **图生图** - 基于上传的图片进行创意变换
 - 🎬 **文生视频** - 根据文本描述生成视频
 - 🎥 **图生视频** - 基于图片生成相关视频
+- 🧷 **Reference 视频生成** - 使用本地 reference 主库辅助普通视频/分镜生成
 - 📊 **多尺寸支持** - 横屏、竖屏等多种规格
 - 🎭 **视频角色功能** - 创建角色，生成角色视频
 - 🎬 **Remix 功能** - 基于已有视频继续创作
@@ -114,6 +115,7 @@ python main.py
 | 图生图 | `gpt-image*` | 使用 `content` 数组 + `image_url` |
 | 文生视频 | `sora2-*` | 使用 `content` 为字符串 |
 | 图生视频 | `sora2-*` | 使用 `content` 数组 + `image_url` |
+| Reference 视频生成 | `sora2-*` | 顶层传 `references: ["s2ref_xxx"]`，仅普通视频/分镜支持 |
 | 视频风格 | `sora2-*` | 在提示词中使用 `{风格ID}` 格式,如 `{anime}提示词` |
 | 创建角色 | `sora2-*` | 使用 `content` 数组 + `video_url` |
 | 角色生成视频 | `sora2-*` | 使用 `content` 数组 + `video_url` + 文本 |
@@ -130,6 +132,31 @@ python main.py
 - **端点**: `http://localhost:8000/v1/chat/completions`
 - **认证**: 在请求头中添加 `Authorization: Bearer YOUR_API_KEY`
 - **默认 API Key**: `han1234`（建议修改）
+
+#### `references` 字段
+
+`POST /v1/chat/completions` 现已支持可选顶层字段 `references`：
+
+- 字段名：`references`
+- 类型：`string[]`
+- 含义：Sora2API 本地 `reference_id` 数组，不是上游原生 `ref_xxx`
+- 数量限制：`0-5` 个，服务端会先去重再校验
+- 适用范围：仅普通视频生成与分镜视频生成；不支持图片、提示词增强、avatar-create、Remix、长视频续写
+
+典型 400 错误：
+
+- `references must be an array of strings`
+- `references supports at most 5 unique ids`
+- `reference <id> not found`
+- `references are only supported for standard video and storyboard generation`
+
+管理后台已新增 `References` 面板，用于维护本地 reference 主库。创建时图片必填；编辑时可选替换图片。
+
+实现说明：
+
+- reference 上游字段结构和时序实现依据为 `C:/Codex/apps/Sora2Api/sora_reference_observation.md`
+- 观察结论确认：上游不会把 `references` 作为 `nf/create` 顶层字段提交，而是折叠进 `inpaint_items`
+- 单项结构固定为 `{ "kind": "reference", "reference_id": "<upstream_ref>" }`
 
 #### 支持的模型
 
@@ -243,6 +270,25 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
         ]
       }
     ],
+    "stream": true
+  }'
+```
+
+**Reference 视频生成**
+
+```bash
+curl -X POST "http://localhost:8000/v1/chat/completions" \
+  -H "Authorization: Bearer han1234" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sora2-landscape-10s",
+    "messages": [
+      {
+        "role": "user",
+        "content": "模特在摄影棚里缓慢转身，镜头跟拍，突出衣服轮廓和花纹细节"
+      }
+    ],
+    "references": ["s2ref_your_reference_id"],
     "stream": true
   }'
 ```

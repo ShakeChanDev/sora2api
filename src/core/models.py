@@ -1,7 +1,7 @@
 """Data models"""
 from datetime import datetime
 from typing import Optional, List, Union
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class Token(BaseModel):
     """Token model"""
@@ -246,6 +246,30 @@ class PowServiceConfig(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
+
+class ReferenceRecord(BaseModel):
+    """Platform-local reference master record."""
+    reference_id: str
+    name: str
+    description: Optional[str] = None
+    type: str = "other"
+    asset_path: str
+    asset_hash: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ReferenceBinding(BaseModel):
+    """Per-token upstream reference binding."""
+    id: Optional[int] = None
+    reference_id: str
+    token_id: int
+    upstream_reference_id: str
+    sync_fingerprint: str
+    last_synced_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
 # API Request/Response models
 class ChatMessage(BaseModel):
     role: str
@@ -257,6 +281,11 @@ class ChatCompletionRequest(BaseModel):
     image: Optional[str] = None
     video: Optional[str] = None  # Base64 encoded video file
     remix_target_id: Optional[str] = None  # Sora share link video ID for remix
+    references: Optional[List[str]] = Field(
+        default=None,
+        description="Sora2API platform-local reference_id array. Optional, only supported by standard video and storyboard generation. Up to 5 unique ids.",
+        examples=[["s2ref_1234567890abcdef"]],
+    )
     stream: bool = False
     max_tokens: Optional[int] = None
 

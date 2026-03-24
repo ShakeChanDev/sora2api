@@ -9,6 +9,8 @@ from .models import (
     TokenStats,
     Task,
     RequestLog,
+    ReferenceBinding,
+    ReferenceRecord,
     AdminConfig,
     ProxyConfig,
     WatermarkFreeConfig,
@@ -125,6 +127,12 @@ class Database:
         payload["polling_context"] = self._deserialize_polling_context(payload.get("polling_context"))
         return Task(**payload)
 
+    def _decode_reference_row(self, row: Dict[str, Any]) -> ReferenceRecord:
+        return ReferenceRecord(**dict(row))
+
+    def _decode_reference_binding_row(self, row: Dict[str, Any]) -> ReferenceBinding:
+        return ReferenceBinding(**dict(row))
+
     async def _table_exists(self, db, table_name: str) -> bool:
         """Check if a table exists in the database"""
         cursor = await db.execute(
@@ -181,7 +189,7 @@ class Database:
                 await db.execute(f"ALTER TABLE {cleanup_table} RENAME TO tokens")
                 await db.execute("CREATE INDEX IF NOT EXISTS idx_token_active ON tokens(is_active)")
                 await db.commit()
-                print("  ✓ Removed legacy token-level egress columns from tokens table")
+                print("  [OK] Removed legacy token-level egress columns from tokens table")
             except Exception:
                 await db.rollback()
                 raise
@@ -437,6 +445,38 @@ class Database:
                 VALUES (1, ?, ?, ?, ?, ?, ?)
             """, (mode, use_token_for_pow, server_url, api_key, proxy_enabled, proxy_url))
 
+    async def _ensure_reference_tables(self, db):
+        """Ensure platform reference tables and indexes exist."""
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS "references" (
+                reference_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                type TEXT NOT NULL,
+                asset_path TEXT NOT NULL,
+                asset_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS reference_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reference_id TEXT NOT NULL,
+                token_id INTEGER NOT NULL,
+                upstream_reference_id TEXT NOT NULL,
+                sync_fingerprint TEXT NOT NULL,
+                last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (reference_id) REFERENCES "references"(reference_id) ON DELETE CASCADE,
+                FOREIGN KEY (token_id) REFERENCES tokens(id) ON DELETE CASCADE,
+                UNIQUE(reference_id, token_id)
+            )
+        """)
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_references_updated_at ON "references"(updated_at)')
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_reference_bindings_reference ON reference_bindings(reference_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_reference_bindings_token ON reference_bindings(token_id)")
 
     async def check_and_migrate_db(self, config_dict: dict = None):
         """Check database integrity and perform migrations if needed
@@ -484,9 +524,9 @@ class Database:
                     if not await self._column_exists(db, "tokens", col_name):
                         try:
                             await db.execute(f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to tokens table")
+                            print(f"  [OK] Added column '{col_name}' to tokens table")
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
                 if await self._column_exists(db, "tokens", "token_hash"):
                     try:
@@ -502,7 +542,7 @@ class Database:
                                 (secret_codec.hash_secret(plain_token), token_id),
                             )
                     except Exception as e:
-                        print(f"  ✗ Failed to backfill token_hash: {e}")
+                        print(f"  [ERROR] Failed to backfill token_hash: {e}")
 
                 await self._rebuild_tokens_table_without_legacy_egress_columns(db)
 
@@ -515,9 +555,9 @@ class Database:
                     if not await self._column_exists(db, "tasks", col_name):
                         try:
                             await db.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to tasks table")
+                            print(f"  [OK] Added column '{col_name}' to tasks table")
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
             # Check and add missing columns to token_stats table
             if await self._table_exists(db, "token_stats"):
@@ -529,9 +569,9 @@ class Database:
                     if not await self._column_exists(db, "token_stats", col_name):
                         try:
                             await db.execute(f"ALTER TABLE token_stats ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to token_stats table")
+                            print(f"  [OK] Added column '{col_name}' to token_stats table")
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
             # Check and add missing columns to admin_config table
             if await self._table_exists(db, "admin_config"):
@@ -546,9 +586,9 @@ class Database:
                     if not await self._column_exists(db, "admin_config", col_name):
                         try:
                             await db.execute(f"ALTER TABLE admin_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to admin_config table")
+                            print(f"  [OK] Added column '{col_name}' to admin_config table")
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
                 if await self._column_exists(db, "admin_config", "nst_browser_api_key"):
                     try:
@@ -574,13 +614,13 @@ class Database:
                     if not await self._column_exists(db, "proxy_config", col_name):
                         try:
                             await db.execute(f"ALTER TABLE proxy_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to proxy_config table")
+                            print(f"  [OK] Added column '{col_name}' to proxy_config table")
                             if col_name == "image_upload_proxy_enabled":
                                 added_image_upload_proxy_enabled_column = True
                             if col_name == "image_upload_proxy_url":
                                 added_image_upload_proxy_url_column = True
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
                 # On upgrade, initialize value from setting.toml only when columns are newly added
                 if config_dict and (added_image_upload_proxy_enabled_column or added_image_upload_proxy_url_column):
@@ -595,7 +635,7 @@ class Database:
                             WHERE id = 1
                         """, (image_upload_proxy_enabled, image_upload_proxy_url))
                     except Exception as e:
-                        print(f"  ✗ Failed to initialize image upload proxy config from config: {e}")
+                        print(f"  [ERROR] Failed to initialize image upload proxy config from config: {e}")
 
             # Check and add missing columns to pow_service_config table
             if await self._table_exists(db, "pow_service_config"):
@@ -608,11 +648,11 @@ class Database:
                     if not await self._column_exists(db, "pow_service_config", col_name):
                         try:
                             await db.execute(f"ALTER TABLE pow_service_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to pow_service_config table")
+                            print(f"  [OK] Added column '{col_name}' to pow_service_config table")
                             if col_name == "use_token_for_pow":
                                 added_use_token_for_pow_column = True
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
                 # On upgrade, initialize value from setting.toml only when this column is newly added
                 if config_dict and added_use_token_for_pow_column:
@@ -624,7 +664,7 @@ class Database:
                             WHERE id = 1
                         """, (use_token_for_pow,))
                     except Exception as e:
-                        print(f"  ✗ Failed to initialize use_token_for_pow from config: {e}")
+                        print(f"  [ERROR] Failed to initialize use_token_for_pow from config: {e}")
 
             # Check and add missing columns to call_logic_config table
             if await self._table_exists(db, "call_logic_config"):
@@ -637,11 +677,11 @@ class Database:
                     if not await self._column_exists(db, "call_logic_config", col_name):
                         try:
                             await db.execute(f"ALTER TABLE call_logic_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to call_logic_config table")
+                            print(f"  [OK] Added column '{col_name}' to call_logic_config table")
                             if col_name == "poll_interval":
                                 added_poll_interval_column = True
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
                 # On upgrade, initialize value from setting.toml only when this column is newly added
                 if config_dict and added_poll_interval_column:
@@ -656,7 +696,7 @@ class Database:
                             WHERE id = 1
                         """, (poll_interval,))
                     except Exception as e:
-                        print(f"  ✗ Failed to initialize poll_interval from config: {e}")
+                        print(f"  [ERROR] Failed to initialize poll_interval from config: {e}")
 
             # Check and add missing columns to watermark_free_config table
             if await self._table_exists(db, "watermark_free_config"):
@@ -671,9 +711,9 @@ class Database:
                     if not await self._column_exists(db, "watermark_free_config", col_name):
                         try:
                             await db.execute(f"ALTER TABLE watermark_free_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to watermark_free_config table")
+                            print(f"  [OK] Added column '{col_name}' to watermark_free_config table")
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
             # Check and add missing columns to request_logs table
             if await self._table_exists(db, "request_logs"):
@@ -689,9 +729,9 @@ class Database:
                     if not await self._column_exists(db, "request_logs", col_name):
                         try:
                             await db.execute(f"ALTER TABLE request_logs ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to request_logs table")
+                            print(f"  [OK] Added column '{col_name}' to request_logs table")
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
             if await self._table_exists(db, "tasks"):
                 columns_to_add = [
@@ -706,9 +746,9 @@ class Database:
                     if not await self._column_exists(db, "tasks", col_name):
                         try:
                             await db.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to tasks table")
+                            print(f"  [OK] Added column '{col_name}' to tasks table")
                         except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                            print(f"  [ERROR] Failed to add column '{col_name}': {e}")
 
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS mutation_attempts (
@@ -764,6 +804,8 @@ class Database:
                     FOREIGN KEY (token_id) REFERENCES tokens(id)
                 )
             """)
+
+            await self._ensure_reference_tables(db)
 
             # Ensure all config tables have their default rows
             # Pass config_dict if available to initialize from setting.toml
@@ -1014,6 +1056,8 @@ class Database:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            await self._ensure_reference_tables(db)
 
             # Create indexes
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
@@ -2348,6 +2392,166 @@ class Database:
                 INSERT OR REPLACE INTO pow_service_config (id, mode, use_token_for_pow, server_url, api_key, proxy_enabled, proxy_url, updated_at)
                 VALUES (1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """, (mode, use_token_for_pow, server_url, api_key, proxy_enabled, proxy_url))
+            await db.commit()
+
+    # Reference master library operations
+    async def list_references(self) -> List[ReferenceRecord]:
+        """List all platform-local references."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT * FROM "references"
+                ORDER BY datetime(updated_at) DESC, reference_id DESC
+            """)
+            rows = await cursor.fetchall()
+            return [self._decode_reference_row(dict(row)) for row in rows]
+
+    async def get_reference(self, reference_id: str) -> Optional[ReferenceRecord]:
+        """Get a platform-local reference by id."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                'SELECT * FROM "references" WHERE reference_id = ?',
+                (reference_id,),
+            )
+            row = await cursor.fetchone()
+            return self._decode_reference_row(dict(row)) if row else None
+
+    async def create_reference(self, reference: ReferenceRecord) -> str:
+        """Persist a platform-local reference."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO "references" (
+                    reference_id, name, description, type, asset_path, asset_hash
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                reference.reference_id,
+                reference.name,
+                reference.description,
+                reference.type,
+                reference.asset_path,
+                reference.asset_hash,
+            ))
+            await db.commit()
+            return reference.reference_id
+
+    async def update_reference(
+        self,
+        reference_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        type: Optional[str] = None,
+        asset_path: Optional[str] = None,
+        asset_hash: Optional[str] = None,
+    ):
+        """Update a platform-local reference."""
+        async with aiosqlite.connect(self.db_path) as db:
+            updates = []
+            params = []
+
+            if name is not None:
+                updates.append("name = ?")
+                params.append(name)
+            if description is not None:
+                updates.append("description = ?")
+                params.append(description)
+            if type is not None:
+                updates.append("type = ?")
+                params.append(type)
+            if asset_path is not None:
+                updates.append("asset_path = ?")
+                params.append(asset_path)
+            if asset_hash is not None:
+                updates.append("asset_hash = ?")
+                params.append(asset_hash)
+
+            if not updates:
+                return
+
+            updates.append("updated_at = CURRENT_TIMESTAMP")
+            params.append(reference_id)
+            query = f'UPDATE "references" SET {", ".join(updates)} WHERE reference_id = ?'
+            await db.execute(query, params)
+            await db.commit()
+
+    async def delete_reference(self, reference_id: str):
+        """Delete a platform-local reference and its bindings."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM reference_bindings WHERE reference_id = ?", (reference_id,))
+            await db.execute('DELETE FROM "references" WHERE reference_id = ?', (reference_id,))
+            await db.commit()
+
+    async def get_reference_binding(self, reference_id: str, token_id: int) -> Optional[ReferenceBinding]:
+        """Get an upstream reference binding for a token."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT * FROM reference_bindings
+                WHERE reference_id = ? AND token_id = ?
+            """, (reference_id, token_id))
+            row = await cursor.fetchone()
+            return self._decode_reference_binding_row(dict(row)) if row else None
+
+    async def list_reference_bindings(
+        self,
+        reference_id: Optional[str] = None,
+        token_id: Optional[int] = None,
+    ) -> List[ReferenceBinding]:
+        """List reference bindings filtered by reference and/or token."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            clauses = []
+            params = []
+            if reference_id is not None:
+                clauses.append("reference_id = ?")
+                params.append(reference_id)
+            if token_id is not None:
+                clauses.append("token_id = ?")
+                params.append(token_id)
+
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            cursor = await db.execute(
+                f"SELECT * FROM reference_bindings {where_sql} ORDER BY datetime(updated_at) DESC, id DESC",
+                tuple(params),
+            )
+            rows = await cursor.fetchall()
+            return [self._decode_reference_binding_row(dict(row)) for row in rows]
+
+    async def upsert_reference_binding(self, binding: ReferenceBinding):
+        """Create or update a token-scoped upstream reference binding."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO reference_bindings (
+                    reference_id, token_id, upstream_reference_id, sync_fingerprint, last_synced_at
+                )
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(reference_id, token_id) DO UPDATE SET
+                    upstream_reference_id = excluded.upstream_reference_id,
+                    sync_fingerprint = excluded.sync_fingerprint,
+                    last_synced_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                binding.reference_id,
+                binding.token_id,
+                binding.upstream_reference_id,
+                binding.sync_fingerprint,
+            ))
+            await db.commit()
+
+    async def delete_reference_binding(self, reference_id: str, token_id: int):
+        """Delete a token-scoped upstream reference binding."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                DELETE FROM reference_bindings
+                WHERE reference_id = ? AND token_id = ?
+            """, (reference_id, token_id))
+            await db.commit()
+
+    async def delete_reference_bindings_for_reference(self, reference_id: str):
+        """Delete all bindings for a local reference."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM reference_bindings WHERE reference_id = ?", (reference_id,))
             await db.commit()
 
 

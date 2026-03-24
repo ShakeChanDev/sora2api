@@ -526,9 +526,18 @@ class MutationExecutor:
                             error_code=cleanup_error_code,
                         )
 
-    async def execute_video_submit(self, prompt: str, token_id: Optional[int], orientation: str, n_frames: int, model: str, size: str, media_id: Optional[str] = None, style_id: Optional[str] = None) -> MutationResult:
+    def _build_video_inpaint_items(self, media_id: Optional[str] = None, reference_ids: Optional[list[str]] = None) -> list[dict]:
+        """Build mixed inpaint_items for video submit."""
+        items = []
+        if media_id:
+            items.append({"kind": "upload", "upload_id": media_id})
+        for reference_id in reference_ids or []:
+            items.append({"kind": "reference", "reference_id": reference_id})
+        return items
+
+    async def execute_video_submit(self, prompt: str, token_id: Optional[int], orientation: str, n_frames: int, model: str, size: str, media_id: Optional[str] = None, style_id: Optional[str] = None, reference_ids: Optional[list[str]] = None) -> MutationResult:
         await self.ensure_video_token_binding(token_id)
-        inpaint_items = [{"kind": "upload", "upload_id": media_id}] if media_id else []
+        inpaint_items = self._build_video_inpaint_items(media_id=media_id, reference_ids=reference_ids)
         result = await self._run_page_plan(
             mutation_type=MutationType.VIDEO_SUBMIT,
             token_id=token_id,
@@ -545,6 +554,7 @@ class MutationExecutor:
                 "project_config": None,
                 "trim_config": None,
                 "metadata": None,
+                "use_image_as_first_frame": False,
                 "cameo_ids": None,
                 "cameo_replacements": None,
                 "model": model,
@@ -552,6 +562,8 @@ class MutationExecutor:
                 "audio_caption": None,
                 "audio_transcript": None,
                 "video_caption": None,
+                "i2v_reference_instruction": None,
+                "remix_prompt_template": None,
                 "storyboard_id": None,
             }, expected_status=200)],
         )
@@ -559,9 +571,9 @@ class MutationExecutor:
             raise BrowserProviderError("page_execute_failed", "Video submit completed without task id")
         return result
 
-    async def execute_storyboard_submit(self, prompt: str, token_id: Optional[int], orientation: str, media_id: Optional[str], n_frames: int, style_id: Optional[str]) -> MutationResult:
+    async def execute_storyboard_submit(self, prompt: str, token_id: Optional[int], orientation: str, media_id: Optional[str], n_frames: int, style_id: Optional[str], reference_ids: Optional[list[str]] = None) -> MutationResult:
         await self.ensure_video_token_binding(token_id)
-        inpaint_items = [{"kind": "upload", "upload_id": media_id}] if media_id else []
+        inpaint_items = self._build_video_inpaint_items(media_id=media_id, reference_ids=reference_ids)
         result = await self._run_page_plan(
             mutation_type=MutationType.STORYBOARD_SUBMIT,
             token_id=token_id,
@@ -580,12 +592,15 @@ class MutationExecutor:
                 "trim_config": None,
                 "model": "sy_8",
                 "metadata": None,
+                "use_image_as_first_frame": False,
                 "style_id": style_id,
                 "cameo_ids": None,
                 "cameo_replacements": None,
                 "audio_caption": None,
                 "audio_transcript": None,
                 "video_caption": None,
+                "i2v_reference_instruction": None,
+                "remix_prompt_template": None,
             }, expected_status=200)],
         )
         if not result.task_id:
